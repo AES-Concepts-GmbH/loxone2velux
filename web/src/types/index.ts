@@ -99,23 +99,57 @@ export interface SensorStatus {
   last_update: string;
 }
 
-// Configuration
+// Node-to-Loxone mapping
+export interface NodeMapping {
+  id: string;
+  name: string;
+  node_id: number;
+  loxone_id: string;
+  enabled: boolean;
+}
+
+export interface UDPFeedbackConfig {
+  enabled: boolean;
+  ip: string;
+  port: number;
+}
+
+// Configuration as returned by GET /api/config (secrets are never returned)
 export interface GatewayConfig {
   klf200: {
     host: string;
     port: number;
-    password: string;
+    password_set: boolean;
     reconnect_interval: string;
     refresh_interval: string;
   };
   server: {
     host: string;
     port: number;
-    api_token: string;
+    api_token_set: boolean;
+  };
+  loxone: {
+    udp_feedback: UDPFeedbackConfig;
+    mappings: NodeMapping[];
   };
   logging: {
     level: string;
     format: string;
+  };
+}
+
+// Partial update for POST /api/config; omitted fields stay unchanged
+export interface GatewayConfigUpdate {
+  klf200?: {
+    host?: string;
+    port?: number;
+    password?: string;
+  };
+  server?: {
+    api_token?: string;
+  };
+  logging?: {
+    level?: string;
   };
 }
 

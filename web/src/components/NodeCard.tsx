@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Node } from '../types';
 import {
   Blinds,
@@ -24,10 +24,14 @@ export function NodeCard({
 }: NodeCardProps) {
   const [localPosition, setLocalPosition] = useState(node.position_percent);
 
-  // Sync local state when node updates
-  if (Math.abs(localPosition - node.position_percent) > 1 && node.state_str !== 'Executing') {
-    setLocalPosition(node.position_percent);
-  }
+  // Sync the slider with the gateway position once the node is no longer moving.
+  useEffect(() => {
+    if (node.state_str !== 'Executing') {
+      setLocalPosition((current) =>
+        Math.abs(current - node.position_percent) > 1 ? node.position_percent : current
+      );
+    }
+  }, [node.position_percent, node.state_str]);
 
   const handlePositionChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setLocalPosition(parseFloat(e.target.value));

@@ -3,7 +3,9 @@ package api
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -18,16 +20,17 @@ import (
 // ConfigManager interface for configuration operations
 type ConfigManager interface {
 	GetConfig() *config.Config
+	GetAPIToken() string
 	UpdateConfig(cfg *config.Config) error
 	GetConfigPath() string
 }
 
 // Handlers holds all HTTP handlers
 type Handlers struct {
-	gateway    *gateway.Service
-	logger     zerolog.Logger
-	configMgr  ConfigManager
-	version    string
+	gateway   *gateway.Service
+	logger    zerolog.Logger
+	configMgr ConfigManager
+	version   string
 }
 
 // NewHandlers creates new handlers
@@ -114,6 +117,14 @@ func (h *Handlers) GetNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, node)
 }
 
+// commandStatus maps a gateway command error to an HTTP status code.
+func commandStatus(err error) int {
+	if errors.Is(err, gateway.ErrNotConnected) || errors.Is(err, gateway.ErrNotConfigured) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
 // SetPosition sets the position of a node
 func (h *Handlers) SetPosition(w http.ResponseWriter, r *http.Request) {
 	nodeID, err := parseNodeID(r)
@@ -128,13 +139,13 @@ func (h *Handlers) SetPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Position < 0 || req.Position > 100 {
+	if req.Position < 0 || req.Position > 100 || math.IsNaN(req.Position) {
 		writeError(w, http.StatusBadRequest, "Position must be between 0 and 100", "")
 		return
 	}
 
 	if err := h.gateway.SetPosition(r.Context(), nodeID, req.Position); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to set position", err.Error())
+		writeError(w, commandStatus(err), "Failed to set position", err.Error())
 		return
 	}
 
@@ -154,7 +165,7 @@ func (h *Handlers) OpenNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.gateway.Open(r.Context(), nodeID); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to open node", err.Error())
+		writeError(w, commandStatus(err), "Failed to open node", err.Error())
 		return
 	}
 
@@ -174,7 +185,7 @@ func (h *Handlers) CloseNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.gateway.Close(r.Context(), nodeID); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to close node", err.Error())
+		writeError(w, commandStatus(err), "Failed to close node", err.Error())
 		return
 	}
 
@@ -194,7 +205,7 @@ func (h *Handlers) StopNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.gateway.StopNode(r.Context(), nodeID); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to stop node", err.Error())
+		writeError(w, commandStatus(err), "Failed to stop node", err.Error())
 		return
 	}
 
@@ -205,114 +216,82 @@ func (h *Handlers) StopNode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Loxone-friendly endpoints (GET requests with URL parameters)
+// Loxone-friendly endpoints (GET requests with URL parameters, plain-text responses)
+
+func writePlain(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(status)
+	w.Write([]byte(body))
+}
+
+// loxoneCommand runs a node command and answers with OK/ERROR.
+func (h *Handlers) loxoneCommand(w http.ResponseWriter, r *http.Request, action string,
+	run func(nodeID uint8) error) {
+	nodeID, err := parseNodeID(r)
+	if err != nil {
+		writePlain(w, http.StatusBadRequest, "ERROR")
+		return
+	}
+
+	if err := run(nodeID); err != nil {
+		h.logger.Error().Err(err).Uint8("node", nodeID).Str("action", action).Msg("Loxone command failed")
+		writePlain(w, commandStatus(err), "ERROR")
+		return
+	}
+
+	writePlain(w, http.StatusOK, "OK")
+}
 
 // LoxoneSetPosition handles Loxone position requests via URL
 func (h *Handlers) LoxoneSetPosition(w http.ResponseWriter, r *http.Request) {
-	nodeID, err := parseNodeID(r)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
 	positionStr := chi.URLParam(r, "position")
 	position, err := strconv.ParseFloat(positionStr, 64)
-	if err != nil || position < 0 || position > 100 {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("ERROR"))
+	if err != nil || math.IsNaN(position) || position < 0 || position > 100 {
+		writePlain(w, http.StatusBadRequest, "ERROR")
 		return
 	}
 
-	if err := h.gateway.SetPosition(r.Context(), nodeID, position); err != nil {
-		h.logger.Error().Err(err).Uint8("node", nodeID).Float64("pos", position).Msg("Failed to set position")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	h.loxoneCommand(w, r, "set", func(nodeID uint8) error {
+		return h.gateway.SetPosition(r.Context(), nodeID, position)
+	})
 }
 
 // LoxoneOpen handles Loxone open requests
 func (h *Handlers) LoxoneOpen(w http.ResponseWriter, r *http.Request) {
-	nodeID, err := parseNodeID(r)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
-	if err := h.gateway.Open(r.Context(), nodeID); err != nil {
-		h.logger.Error().Err(err).Uint8("node", nodeID).Msg("Failed to open")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	h.loxoneCommand(w, r, "open", func(nodeID uint8) error {
+		return h.gateway.Open(r.Context(), nodeID)
+	})
 }
 
 // LoxoneClose handles Loxone close requests
 func (h *Handlers) LoxoneClose(w http.ResponseWriter, r *http.Request) {
-	nodeID, err := parseNodeID(r)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("ERROR"))
-		return
-	}
+	h.loxoneCommand(w, r, "close", func(nodeID uint8) error {
+		return h.gateway.Close(r.Context(), nodeID)
+	})
+}
 
-	if err := h.gateway.Close(r.Context(), nodeID); err != nil {
-		h.logger.Error().Err(err).Uint8("node", nodeID).Msg("Failed to close")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+// LoxoneStop handles Loxone stop requests
+func (h *Handlers) LoxoneStop(w http.ResponseWriter, r *http.Request) {
+	h.loxoneCommand(w, r, "stop", func(nodeID uint8) error {
+		return h.gateway.StopNode(r.Context(), nodeID)
+	})
 }
 
 // LoxoneGetPosition returns the current position of a node as a plain number (0-100)
 func (h *Handlers) LoxoneGetPosition(w http.ResponseWriter, r *http.Request) {
 	nodeID, err := parseNodeID(r)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("ERROR"))
+		writePlain(w, http.StatusBadRequest, "ERROR")
 		return
 	}
 
 	node, ok := h.gateway.GetNode(nodeID)
 	if !ok {
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("ERROR"))
+		writePlain(w, http.StatusNotFound, "ERROR")
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(strconv.Itoa(int(node.PositionPercent))))
-}
-
-// LoxoneStop handles Loxone stop requests
-func (h *Handlers) LoxoneStop(w http.ResponseWriter, r *http.Request) {
-	nodeID, err := parseNodeID(r)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
-	if err := h.gateway.StopNode(r.Context(), nodeID); err != nil {
-		h.logger.Error().Err(err).Uint8("node", nodeID).Msg("Failed to stop")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("ERROR"))
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	writePlain(w, http.StatusOK, strconv.Itoa(int(math.Round(node.PositionPercent))))
 }
 
 // Sensor endpoints
@@ -326,7 +305,7 @@ func (h *Handlers) GetSensorStatus(w http.ResponseWriter, r *http.Request) {
 // RefreshSensorStatus triggers a refresh of sensor data from the KLF-200
 func (h *Handlers) RefreshSensorStatus(w http.ResponseWriter, r *http.Request) {
 	if err := h.gateway.RefreshSensorStatus(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to refresh sensor status", err.Error())
+		writeError(w, commandStatus(err), "Failed to refresh sensor status", err.Error())
 		return
 	}
 
@@ -336,50 +315,39 @@ func (h *Handlers) RefreshSensorStatus(w http.ResponseWriter, r *http.Request) {
 
 // Loxone-friendly sensor endpoints (return simple 0/1 values)
 
+func boolToDigit(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
 // LoxoneSensorStatus returns all sensor values in Loxone-friendly format
 func (h *Handlers) LoxoneSensorStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.gateway.GetSensorStatus()
-	rain := 0
-	wind := 0
-	if status.RainDetected {
-		rain = 1
-	}
-	if status.WindDetected {
-		wind = 1
-	}
 	// Format: rain;wind (e.g., "0;0" or "1;0")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(strconv.Itoa(rain) + ";" + strconv.Itoa(wind)))
+	writePlain(w, http.StatusOK, boolToDigit(status.RainDetected)+";"+boolToDigit(status.WindDetected))
 }
 
 // LoxoneRainStatus returns just the rain sensor value (0 or 1)
 func (h *Handlers) LoxoneRainStatus(w http.ResponseWriter, r *http.Request) {
-	status := h.gateway.GetSensorStatus()
-	if status.RainDetected {
-		w.Write([]byte("1"))
-	} else {
-		w.Write([]byte("0"))
-	}
+	writePlain(w, http.StatusOK, boolToDigit(h.gateway.GetSensorStatus().RainDetected))
 }
 
 // LoxoneWindStatus returns just the wind sensor value (0 or 1)
 func (h *Handlers) LoxoneWindStatus(w http.ResponseWriter, r *http.Request) {
-	status := h.gateway.GetSensorStatus()
-	if status.WindDetected {
-		w.Write([]byte("1"))
-	} else {
-		w.Write([]byte("0"))
-	}
+	writePlain(w, http.StatusOK, boolToDigit(h.gateway.GetSensorStatus().WindDetected))
 }
 
 // Configuration endpoints
 
-// ConfigResponse is the JSON structure for config API
+// ConfigResponse is the JSON structure returned by GET /api/config. Secrets
+// are never returned; *_set flags tell whether a value is configured.
 type ConfigResponse struct {
-	KLF200  ConfigKLF200        `json:"klf200"`
-	Server  ConfigServer        `json:"server"`
-	Loxone  ConfigLoxone        `json:"loxone"`
-	Logging ConfigLogging       `json:"logging"`
+	KLF200  ConfigKLF200  `json:"klf200"`
+	Server  ConfigServer  `json:"server"`
+	Loxone  ConfigLoxone  `json:"loxone"`
+	Logging ConfigLogging `json:"logging"`
 }
 
 type ConfigLoxone struct {
@@ -390,15 +358,15 @@ type ConfigLoxone struct {
 type ConfigKLF200 struct {
 	Host              string `json:"host"`
 	Port              int    `json:"port"`
-	Password          string `json:"password"`
+	PasswordSet       bool   `json:"password_set"`
 	ReconnectInterval string `json:"reconnect_interval"`
 	RefreshInterval   string `json:"refresh_interval"`
 }
 
 type ConfigServer struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	APIToken string `json:"api_token"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	APITokenSet bool   `json:"api_token_set"`
 }
 
 type ConfigLogging struct {
@@ -406,26 +374,36 @@ type ConfigLogging struct {
 	Format string `json:"format"`
 }
 
-// GetConfig returns the current configuration
-func (h *Handlers) GetConfig(w http.ResponseWriter, r *http.Request) {
-	if h.configMgr == nil {
-		writeError(w, http.StatusServiceUnavailable, "Configuration manager not available", "")
-		return
-	}
+// ConfigUpdateRequest is the JSON structure accepted by POST /api/config.
+// Omitted fields are left unchanged. An explicit empty api_token disables
+// authentication.
+type ConfigUpdateRequest struct {
+	KLF200 struct {
+		Host     *string `json:"host"`
+		Port     *int    `json:"port"`
+		Password *string `json:"password"`
+	} `json:"klf200"`
+	Server struct {
+		APIToken *string `json:"api_token"`
+	} `json:"server"`
+	Logging struct {
+		Level *string `json:"level"`
+	} `json:"logging"`
+}
 
-	cfg := h.configMgr.GetConfig()
-	resp := ConfigResponse{
+func (h *Handlers) configResponse(cfg *config.Config) ConfigResponse {
+	return ConfigResponse{
 		KLF200: ConfigKLF200{
 			Host:              cfg.KLF200.Host,
 			Port:              cfg.KLF200.Port,
-			Password:          cfg.KLF200.Password,
+			PasswordSet:       cfg.KLF200.Password != "",
 			ReconnectInterval: cfg.KLF200.ReconnectInterval.String(),
 			RefreshInterval:   cfg.KLF200.RefreshInterval.String(),
 		},
 		Server: ConfigServer{
-			Host:     cfg.Server.Host,
-			Port:     cfg.Server.Port,
-			APIToken: cfg.Server.APIToken,
+			Host:        cfg.Server.Host,
+			Port:        cfg.Server.Port,
+			APITokenSet: cfg.Server.APIToken != "",
 		},
 		Loxone: ConfigLoxone{
 			UDPFeedback: cfg.Loxone.UDPFeedback,
@@ -436,8 +414,16 @@ func (h *Handlers) GetConfig(w http.ResponseWriter, r *http.Request) {
 			Format: cfg.Logging.Format,
 		},
 	}
+}
 
-	writeJSON(w, http.StatusOK, resp)
+// GetConfig returns the current configuration (without secrets)
+func (h *Handlers) GetConfig(w http.ResponseWriter, r *http.Request) {
+	if h.configMgr == nil {
+		writeError(w, http.StatusServiceUnavailable, "Configuration manager not available", "")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, h.configResponse(h.configMgr.GetConfig()))
 }
 
 // UpdateConfig updates the configuration
@@ -447,7 +433,7 @@ func (h *Handlers) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req ConfigResponse
+	var req ConfigUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
@@ -456,41 +442,50 @@ func (h *Handlers) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Get current config and update it
 	cfg := h.configMgr.GetConfig()
 
-	// Update KLF200 settings
-	if req.KLF200.Host != "" {
-		cfg.KLF200.Host = req.KLF200.Host
+	if req.KLF200.Host != nil {
+		cfg.KLF200.Host = *req.KLF200.Host
 	}
-	if req.KLF200.Port > 0 {
-		cfg.KLF200.Port = req.KLF200.Port
+	if req.KLF200.Port != nil {
+		cfg.KLF200.Port = *req.KLF200.Port
 	}
-	if req.KLF200.Password != "" {
-		cfg.KLF200.Password = req.KLF200.Password
+	if req.KLF200.Password != nil && *req.KLF200.Password != "" {
+		cfg.KLF200.Password = *req.KLF200.Password
 	}
-
-	// Update server settings (API token can be empty to disable auth)
-	cfg.Server.APIToken = req.Server.APIToken
-
-	// Update logging settings
-	if req.Logging.Level != "" {
-		cfg.Logging.Level = req.Logging.Level
+	if req.Server.APIToken != nil {
+		cfg.Server.APIToken = *req.Server.APIToken
+	}
+	if req.Logging.Level != nil {
+		cfg.Logging.Level = *req.Logging.Level
 	}
 
-	// Save config
-	if err := h.configMgr.UpdateConfig(cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to save configuration", err.Error())
+	if err := h.saveConfig(w, cfg, "Failed to save configuration"); err != nil {
 		return
 	}
 
 	h.logger.Info().Msg("Configuration updated")
 
-	// Return updated config
-	h.GetConfig(w, r)
+	writeJSON(w, http.StatusOK, h.configResponse(cfg))
+}
+
+// saveConfig persists cfg and writes an error response on failure
+// (400 for validation errors, 500 otherwise).
+func (h *Handlers) saveConfig(w http.ResponseWriter, cfg *config.Config, message string) error {
+	err := h.configMgr.UpdateConfig(cfg)
+	if err == nil {
+		return nil
+	}
+	status := http.StatusInternalServerError
+	if config.IsValidationError(err) {
+		status = http.StatusBadRequest
+	}
+	writeError(w, status, message, err.Error())
+	return err
 }
 
 // Reconnect triggers a reconnection to the KLF-200
 func (h *Handlers) Reconnect(w http.ResponseWriter, r *http.Request) {
 	if err := h.gateway.Reconnect(r.Context()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+		writeJSON(w, commandStatus(err), map[string]interface{}{
 			"success": false,
 			"message": err.Error(),
 		})
@@ -499,7 +494,7 @@ func (h *Handlers) Reconnect(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "Reconnection initiated",
+		"message": "Reconnected",
 	})
 }
 
@@ -541,9 +536,22 @@ func generateUUID() (string, error) {
 
 // Mapping CRUD endpoints
 
+// mappingRequest is the JSON body for creating/updating a mapping. "enabled"
+// defaults to true when omitted.
+type mappingRequest struct {
+	Name     string `json:"name"`
+	NodeID   uint8  `json:"node_id"`
+	LoxoneID string `json:"loxone_id"`
+	Enabled  *bool  `json:"enabled"`
+}
+
+func (m *mappingRequest) enabled() bool {
+	return m.Enabled == nil || *m.Enabled
+}
+
 // ListMappings returns all node-to-Loxone mappings
 func (h *Handlers) ListMappings(w http.ResponseWriter, r *http.Request) {
-	mappings := h.gateway.GetMappingManager().GetAll()
+	mappings := h.configMgr.GetConfig().Loxone.Mappings
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"mappings": mappings,
 		"count":    len(mappings),
@@ -552,13 +560,13 @@ func (h *Handlers) ListMappings(w http.ResponseWriter, r *http.Request) {
 
 // CreateMapping creates a new node mapping
 func (h *Handlers) CreateMapping(w http.ResponseWriter, r *http.Request) {
-	var mapping config.NodeMapping
-	if err := json.NewDecoder(r.Body).Decode(&mapping); err != nil {
+	var req mappingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
 
-	if mapping.LoxoneID == "" {
+	if req.LoxoneID == "" {
 		writeError(w, http.StatusBadRequest, "loxone_id is required", "")
 		return
 	}
@@ -568,13 +576,17 @@ func (h *Handlers) CreateMapping(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to generate mapping ID", err.Error())
 		return
 	}
-	mapping.ID = id
-	mapping.Enabled = true
+	mapping := config.NodeMapping{
+		ID:       id,
+		Name:     req.Name,
+		NodeID:   req.NodeID,
+		LoxoneID: req.LoxoneID,
+		Enabled:  req.enabled(),
+	}
 
 	cfg := h.configMgr.GetConfig()
 	cfg.Loxone.Mappings = append(cfg.Loxone.Mappings, mapping)
-	if err := h.configMgr.UpdateConfig(cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to save mapping", err.Error())
+	if err := h.saveConfig(w, cfg, "Failed to save mapping"); err != nil {
 		return
 	}
 
@@ -585,34 +597,43 @@ func (h *Handlers) CreateMapping(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) UpdateMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mappingID")
 
-	var update config.NodeMapping
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+	var req mappingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
 
+	if req.LoxoneID == "" {
+		writeError(w, http.StatusBadRequest, "loxone_id is required", "")
+		return
+	}
+
 	cfg := h.configMgr.GetConfig()
-	found := false
-	for i, m := range cfg.Loxone.Mappings {
-		if m.ID == mappingID {
-			update.ID = mappingID
-			cfg.Loxone.Mappings[i] = update
-			found = true
+	var updated *config.NodeMapping
+	for i := range cfg.Loxone.Mappings {
+		if cfg.Loxone.Mappings[i].ID == mappingID {
+			cfg.Loxone.Mappings[i] = config.NodeMapping{
+				ID:       mappingID,
+				Name:     req.Name,
+				NodeID:   req.NodeID,
+				LoxoneID: req.LoxoneID,
+				Enabled:  req.enabled(),
+			}
+			updated = &cfg.Loxone.Mappings[i]
 			break
 		}
 	}
 
-	if !found {
+	if updated == nil {
 		writeError(w, http.StatusNotFound, "Mapping not found", "")
 		return
 	}
 
-	if err := h.configMgr.UpdateConfig(cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to save mapping", err.Error())
+	if err := h.saveConfig(w, cfg, "Failed to save mapping"); err != nil {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, update)
+	writeJSON(w, http.StatusOK, updated)
 }
 
 // DeleteMapping deletes a mapping
@@ -637,8 +658,7 @@ func (h *Handlers) DeleteMapping(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg.Loxone.Mappings = newMappings
-	if err := h.configMgr.UpdateConfig(cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to delete mapping", err.Error())
+	if err := h.saveConfig(w, cfg, "Failed to delete mapping"); err != nil {
 		return
 	}
 
@@ -667,8 +687,7 @@ func (h *Handlers) UpdateLoxoneUDPConfig(w http.ResponseWriter, r *http.Request)
 	cfg := h.configMgr.GetConfig()
 	cfg.Loxone.UDPFeedback = req
 
-	if err := h.configMgr.UpdateConfig(cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to save config", err.Error())
+	if err := h.saveConfig(w, cfg, "Failed to save config"); err != nil {
 		return
 	}
 

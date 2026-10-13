@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -49,12 +51,19 @@ func (m *ConfigManager) GetConfig() *config.Config {
 	return m.cfg.Clone()
 }
 
+// GetAPIToken returns the currently active API token ("" = no auth).
+func (m *ConfigManager) GetAPIToken() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.Server.APIToken
+}
+
 // GetConfigPath returns the path to the config file
 func (m *ConfigManager) GetConfigPath() string {
 	return m.configPath
 }
 
-// UpdateConfig updates and saves the configuration
+// UpdateConfig validates, persists and applies a new configuration.
 func (m *ConfigManager) UpdateConfig(cfg *config.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -82,21 +91,38 @@ func (m *ConfigManager) UpdateConfig(cfg *config.Config) error {
 		}
 	}
 
+	// Apply log level immediately
+	if cfg.Logging.Level != m.cfg.Logging.Level {
+		applyLogLevel(cfg.Logging.Level)
+		m.logger.Info().Str("level", cfg.Logging.Level).Msg("Log level changed")
+	}
+
+	if cfg.Server.APIToken != m.cfg.Server.APIToken {
+		if cfg.Server.APIToken == "" {
+			m.logger.Warn().Msg("API token removed - the API is now reachable without authentication")
+		} else {
+			m.logger.Info().Msg("API token changed")
+		}
+	}
+
 	// Update gateway config and reconnect if KLF-200 settings changed
-	klfChanged := m.cfg.KLF200.Host != cfg.KLF200.Host ||
-		m.cfg.KLF200.Port != cfg.KLF200.Port ||
-		m.cfg.KLF200.Password != cfg.KLF200.Password
+	klfChanged := m.cfg.KLF200 != cfg.KLF200
 	if klfChanged {
 		m.gateway.UpdateConfig(&cfg.KLF200)
-		// Reconnect in the background so the new credentials take effect without
-		// blocking the HTTP response.
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := m.gateway.Reconnect(ctx); err != nil {
-				m.logger.Warn().Err(err).Msg("Reconnect after config change failed")
-			}
-		}()
+		connChanged := m.cfg.KLF200.Host != cfg.KLF200.Host ||
+			m.cfg.KLF200.Port != cfg.KLF200.Port ||
+			m.cfg.KLF200.Password != cfg.KLF200.Password
+		if connChanged {
+			// Reconnect in the background so the new credentials take effect without
+			// blocking the HTTP response.
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := m.gateway.Reconnect(ctx); err != nil {
+					m.logger.Warn().Err(err).Msg("Reconnect after config change failed")
+				}
+			}()
+		}
 	}
 
 	// Reconfigure UDP sender and mappings
@@ -124,32 +150,29 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Load configuration. config.Load already validates the file; the
-	// defaults-from-env path below is validated explicitly.
+	// Load configuration. A missing file is not an error: defaults plus the
+	// KLF200_HOST / KLF200_PASSWORD environment variables are used instead.
 	cfg, err := config.Load(*configPath)
+	configFromFile := true
 	if err != nil {
-		// Try to use defaults if config file doesn't exist
-		if os.IsNotExist(err) {
-			cfg = config.DefaultConfig()
-			// Check for environment variables
-			if host := os.Getenv("KLF200_HOST"); host != "" {
-				cfg.KLF200.Host = host
-			}
-			if password := os.Getenv("KLF200_PASSWORD"); password != "" {
-				cfg.KLF200.Password = password
-			}
-			if err := cfg.Validate(); err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: Invalid configuration: %s\n", err.Error())
-				os.Exit(1)
-			}
-		} else {
+		if !errors.Is(err, fs.ErrNotExist) {
 			fmt.Fprintf(os.Stderr, "ERROR: Failed to load configuration: %s\n", err.Error())
+			os.Exit(1)
+		}
+		configFromFile = false
+		cfg = config.DefaultConfig()
+		cfg.ApplyEnv()
+		if err := cfg.Validate(); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %s\n", err.Error())
 			os.Exit(1)
 		}
 	}
 
 	// Setup logger
 	logger := setupLogger(cfg.Logging)
+	if !configFromFile {
+		logger.Warn().Str("path", *configPath).Msg("Config file not found, using defaults and environment variables")
+	}
 
 	// Overlay the UI-managed Loxone settings from the sidecar file, if present.
 	// This is kept separate from config.yaml so mappings and UDP feedback
@@ -158,7 +181,7 @@ func main() {
 	if lc, lerr := config.LoadLoxoneConfig(loxonePath); lerr == nil {
 		cfg.Loxone = *lc
 		logger.Info().Str("path", loxonePath).Msg("Loaded Loxone configuration from sidecar")
-	} else if !os.IsNotExist(lerr) {
+	} else if !errors.Is(lerr, fs.ErrNotExist) {
 		logger.Warn().Err(lerr).Str("path", loxonePath).Msg("Failed to load Loxone sidecar config")
 	}
 
@@ -169,18 +192,16 @@ func main() {
 		Int("server_port", cfg.Server.Port).
 		Msg("Starting Loxone2Velux Gateway")
 
-	// Create gateway service
-	gw := gateway.NewService(&cfg.KLF200, &cfg.Loxone, logger)
+	if cfg.Server.APIToken == "" {
+		logger.Warn().Msg("No API token configured - anyone who can reach the HTTP port can control the devices. Set server.api_token to enable authentication.")
+	}
 
-	// Only start gateway if KLF200 is configured
-	if cfg.IsKLF200Configured() {
-		ctx := context.Background()
-		if err := gw.Start(ctx); err != nil {
-			// Don't fail - will retry in background
-			logger.Warn().Err(err).Msg("Initial KLF-200 connection failed, will retry in background")
-		}
-	} else {
-		logger.Warn().Msg("KLF-200 not configured (host or password missing) - gateway not started. Configure via web UI or add-on settings.")
+	// Create gateway service. Background loops are always started so that a
+	// KLF-200 configured later via the API is picked up.
+	gw := gateway.NewService(&cfg.KLF200, &cfg.Loxone, logger)
+	if err := gw.Start(context.Background()); err != nil {
+		// Don't fail - will retry in background
+		logger.Warn().Err(err).Msg("Initial KLF-200 connection failed, will retry in background")
 	}
 
 	// Create config manager
@@ -218,13 +239,16 @@ func main() {
 	logger.Info().Msg("Goodbye!")
 }
 
-func setupLogger(cfg config.LoggingConfig) zerolog.Logger {
-	// Set log level
-	level, err := zerolog.ParseLevel(cfg.Level)
-	if err != nil {
+func applyLogLevel(levelStr string) {
+	level, err := zerolog.ParseLevel(levelStr)
+	if err != nil || levelStr == "" {
 		level = zerolog.InfoLevel
 	}
 	zerolog.SetGlobalLevel(level)
+}
+
+func setupLogger(cfg config.LoggingConfig) zerolog.Logger {
+	applyLogLevel(cfg.Level)
 
 	// Set output format
 	var logger zerolog.Logger

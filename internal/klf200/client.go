@@ -1,10 +1,11 @@
 package klf200
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,9 @@ type Client struct {
 	password string
 	logger   zerolog.Logger
 
+	// conn is the active connection. It is only ever replaced while connMu
+	// is held. The read loop keeps its own reference so it can tell whether
+	// the connection it is reading from is still the current one.
 	conn          *tls.Conn
 	connMu        sync.Mutex
 	connected     atomic.Bool
@@ -29,29 +33,25 @@ type Client struct {
 
 	sessionID atomic.Uint32
 
-	// Callbacks
+	// Callbacks (set before Connect, read from the read loop)
 	onNodeUpdate   func(*Node)
 	onSensorUpdate func(SensorStatus)
 	onDisconnect   func(error)
 
-	// Read buffer for SLIP framing
-	readBuf bytes.Buffer
-	readMu  sync.Mutex
-
-	// Response channels
+	// Response channel for request/response exchanges
 	responseChan chan *Frame
-	stopChan     chan struct{}
 	wg           sync.WaitGroup
 
 	// exchangeMu serializes request/response exchanges that read from
-	// responseChan (Authenticate, GetAllNodes, SetPosition, Stop,
+	// responseChan (Authenticate, GetAllNodes, SetPosition, Stop, GetState,
 	// GetLimitationStatus) so concurrent callers cannot steal each other's
 	// confirmation frames. This is a coarse lock, not per-session demux.
 	exchangeMu sync.Mutex
 
-	// Sensor status
-	sensorStatus   SensorStatus
-	sensorStatusMu sync.RWMutex
+	// Sensor status, derived from the per-node limitation originators.
+	sensorStatus    SensorStatus
+	nodeLimitations map[uint8]LimitationOriginator
+	sensorStatusMu  sync.RWMutex
 }
 
 // ClientConfig holds configuration for the KLF-200 client
@@ -65,12 +65,12 @@ type ClientConfig struct {
 // NewClient creates a new KLF-200 client
 func NewClient(cfg ClientConfig) *Client {
 	return &Client{
-		host:         cfg.Host,
-		port:         cfg.Port,
-		password:     cfg.Password,
-		logger:       cfg.Logger,
-		responseChan: make(chan *Frame, 100),
-		stopChan:     make(chan struct{}),
+		host:            cfg.Host,
+		port:            cfg.Port,
+		password:        cfg.Password,
+		logger:          cfg.Logger,
+		responseChan:    make(chan *Frame, 100),
+		nodeLimitations: make(map[uint8]LimitationOriginator),
 	}
 }
 
@@ -102,36 +102,97 @@ func (c *Client) SetDisconnectCallback(cb func(error)) {
 	c.onDisconnect = cb
 }
 
+// veluxCA is the parsed Velux root certificate used to verify the KLF-200.
+var veluxCA *x509.Certificate
+
+func init() {
+	block, _ := pem.Decode([]byte(VeluxCA))
+	if block == nil {
+		panic("klf200: embedded Velux CA certificate is not valid PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		panic("klf200: embedded Velux CA certificate is invalid: " + err.Error())
+	}
+	veluxCA = cert
+}
+
+// verifyVeluxCertificate verifies the KLF-200 certificate chain against the
+// embedded Velux CA.
+//
+// The KLF-200 certificate has no usable hostname (no CN/SAN matching the IP)
+// and the Velux CA expired in 2026, while devices in the field keep using it.
+// We therefore verify the signature chain but deliberately ignore hostname
+// and validity period: the check is done at a point in time at which the
+// presented leaf certificate was valid. A certificate that was not issued by
+// the Velux CA is still rejected, which is what protects against a spoofed
+// gateway on the LAN.
+func verifyVeluxCertificate(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	if len(rawCerts) == 0 {
+		return errors.New("KLF-200 presented no certificate")
+	}
+
+	certs := make([]*x509.Certificate, 0, len(rawCerts))
+	for _, raw := range rawCerts {
+		cert, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return fmt.Errorf("failed to parse KLF-200 certificate: %w", err)
+		}
+		certs = append(certs, cert)
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(veluxCA)
+	intermediates := x509.NewCertPool()
+	for _, cert := range certs[1:] {
+		intermediates.AddCert(cert)
+	}
+
+	leaf := certs[0]
+	// Candidate verification times: the leaf must have been valid at its own
+	// NotBefore; fall back to the CA's NotBefore for oddly dated leaves.
+	candidates := []time.Time{
+		leaf.NotBefore.Add(time.Second),
+		veluxCA.NotBefore.Add(time.Second),
+	}
+
+	var lastErr error
+	for _, at := range candidates {
+		opts := x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			CurrentTime:   at,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		}
+		if _, err := leaf.Verify(opts); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return fmt.Errorf("KLF-200 certificate is not signed by the Velux CA: %w", lastErr)
+}
+
 // Connect establishes connection to the KLF-200
 func (c *Client) Connect(ctx context.Context) error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
-	if c.connected.Load() {
+	if c.conn != nil && c.connected.Load() {
 		return nil
-	}
-
-	// Reset stopChan if it was closed
-	select {
-	case <-c.stopChan:
-		c.stopChan = make(chan struct{})
-	default:
 	}
 
 	addr := fmt.Sprintf("%s:%d", c.host, c.port)
 	c.logger.Info().Str("addr", addr).Msg("Connecting to KLF-200")
 
-	// Configure TLS with Velux CA certificate
-	// KLF-200 uses a self-signed certificate without proper CN/SAN
-	// We verify using the CA certificate but skip hostname verification
-	certPool := x509.NewCertPool()
-	certPool.AppendCertsFromPEM([]byte(VeluxCA))
-
+	// InsecureSkipVerify disables Go's built-in verification (which would
+	// fail on the missing hostname and the expired CA); the chain is instead
+	// verified explicitly in verifyVeluxCertificate.
 	tlsConfig := &tls.Config{
-		RootCAs:            certPool,
-		InsecureSkipVerify: true, // Skip hostname verification (no CN/SAN in cert)
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS12,
+		InsecureSkipVerify:    true, //nolint:gosec // custom chain verification below
+		VerifyPeerCertificate: verifyVeluxCertificate,
+		MinVersion:            tls.VersionTLS12,
+		MaxVersion:            tls.VersionTLS12,
 	}
 
 	// Create dialer with timeout
@@ -155,13 +216,17 @@ func (c *Client) Connect(ctx context.Context) error {
 		conn.SetDeadline(time.Now().Add(10 * time.Second))
 	}
 
-	if err := conn.Handshake(); err != nil {
+	if err := conn.HandshakeContext(ctx); err != nil {
 		netConn.Close()
 		return fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
 	// Clear deadline
 	conn.SetDeadline(time.Time{})
+
+	// Drop stale frames from a previous connection so they cannot satisfy
+	// an exchange on the new one.
+	c.drainResponses()
 
 	c.conn = conn
 	c.connected.Store(true)
@@ -174,6 +239,17 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.logger.Info().Msg("Connected to KLF-200")
 
 	return nil
+}
+
+// drainResponses discards everything currently queued in responseChan.
+func (c *Client) drainResponses() {
+	for {
+		select {
+		case <-c.responseChan:
+		default:
+			return
+		}
+	}
 }
 
 // Authenticate authenticates with the KLF-200
@@ -190,14 +266,9 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	// Send password. Note: the frame embeds the password bytes, so it must
 	// never be logged in cleartext.
 	frame := BuildPasswordEnterRequest(c.password)
-	c.logger.Debug().
-		Int("len", len(frame)).
-		Msg("Sending password frame")
-
 	if err := c.sendRaw(frame); err != nil {
 		return fmt.Errorf("failed to send password: %w", err)
 	}
-	c.logger.Debug().Msg("Password frame sent")
 
 	// Wait for response
 	resp, err := c.waitForResponse(ctx, GW_PASSWORD_ENTER_CFM, 10*time.Second)
@@ -236,7 +307,30 @@ func (c *Client) enableHouseStatusMonitor(ctx context.Context) error {
 	return err
 }
 
-// GetAllNodes retrieves all nodes from the KLF-200
+// GetState sends GW_GET_STATE_REQ and waits for the confirmation. It is used
+// as a keep-alive: the KLF-200 closes connections that stay idle for too
+// long, and a missing confirmation reveals a dead connection.
+func (c *Client) GetState(ctx context.Context) error {
+	if !c.authenticated.Load() {
+		return fmt.Errorf("not authenticated")
+	}
+
+	c.exchangeMu.Lock()
+	defer c.exchangeMu.Unlock()
+
+	if err := c.sendRaw(BuildGetStateRequest()); err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+
+	if _, err := c.waitForResponse(ctx, GW_GET_STATE_CFM, 5*time.Second); err != nil {
+		return fmt.Errorf("no response to GW_GET_STATE_REQ: %w", err)
+	}
+	return nil
+}
+
+// GetAllNodes retrieves all nodes from the KLF-200. It returns an error if
+// the node list was not received completely, so callers never replace a
+// good cache with a truncated list.
 func (c *Client) GetAllNodes(ctx context.Context) ([]*Node, error) {
 	if !c.authenticated.Load() {
 		return nil, fmt.Errorf("not authenticated")
@@ -253,9 +347,13 @@ func (c *Client) GetAllNodes(ctx context.Context) ([]*Node, error) {
 	}
 
 	// Wait for confirmation
-	_, err := c.waitForResponse(ctx, GW_GET_ALL_NODES_INFORMATION_CFM, 5*time.Second)
+	cfm, err := c.waitForResponse(ctx, GW_GET_ALL_NODES_INFORMATION_CFM, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get confirmation: %w", err)
+	}
+	// Status 0 = OK, 1 = system table empty (no nodes)
+	if len(cfm.Data) > 0 && cfm.Data[0] == 1 {
+		return []*Node{}, nil
 	}
 
 	// Collect node notifications
@@ -263,7 +361,7 @@ func (c *Client) GetAllNodes(ctx context.Context) ([]*Node, error) {
 	for {
 		resp, err := c.waitForResponse(ctx, 0, 5*time.Second) // Accept any response
 		if err != nil {
-			return nodes, nil // Timeout means no more nodes
+			return nil, fmt.Errorf("node list incomplete (%d nodes received): %w", len(nodes), err)
 		}
 
 		switch resp.Command {
@@ -286,6 +384,12 @@ func (c *Client) GetAllNodes(ctx context.Context) ([]*Node, error) {
 
 // SetPosition sets the position of a node (0-100%)
 func (c *Client) SetPosition(ctx context.Context, nodeID uint8, percent float64) error {
+	return c.sendMainParameter(ctx, nodeID, PercentToPosition(percent))
+}
+
+// sendMainParameter sends a GW_COMMAND_SEND_REQ with the given main parameter
+// and waits for the confirmation.
+func (c *Client) sendMainParameter(ctx context.Context, nodeID uint8, mainParameter uint16) error {
 	if !c.authenticated.Load() {
 		return fmt.Errorf("not authenticated")
 	}
@@ -293,49 +397,43 @@ func (c *Client) SetPosition(ctx context.Context, nodeID uint8, percent float64)
 	c.exchangeMu.Lock()
 	defer c.exchangeMu.Unlock()
 
-	position := PercentToPosition(percent)
 	sessionID := uint16(c.sessionID.Add(1))
 
 	c.logger.Debug().
 		Uint8("node", nodeID).
-		Float64("percent", percent).
-		Uint16("position", position).
-		Msg("Setting position")
+		Uint16("sessionID", sessionID).
+		Uint16("mainParameter", mainParameter).
+		Msg("Sending command")
 
 	frame := BuildCommandSendRequest(
 		sessionID,
 		1, // User originated
 		PriorityUserLevel2,
 		[]uint8{nodeID},
-		position,
+		mainParameter,
 		nil,
 	)
-
-	c.logger.Debug().
-		Hex("frame", frame).
-		Int("len", len(frame)).
-		Msg("Sending command frame")
 
 	if err := c.sendRaw(frame); err != nil {
 		return fmt.Errorf("failed to send command: %w", err)
 	}
 
 	// Wait for confirmation (GW_COMMAND_SEND_CFM) or error (GW_ERROR_NTF)
-	return c.waitForCommandConfirm(ctx)
+	return c.waitForCommandConfirm(ctx, sessionID)
 }
 
 // waitForCommandConfirm waits for a GW_COMMAND_SEND_CFM (or GW_ERROR_NTF)
 // after a command has been sent. Any other (async) frames that slip into the
 // response channel are dispatched via handleAsyncFrame. Callers must hold
 // exchangeMu so confirmations are not consumed by a concurrent exchange.
-func (c *Client) waitForCommandConfirm(ctx context.Context) error {
+func (c *Client) waitForCommandConfirm(ctx context.Context, sessionID uint16) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("command timeout")
+			return fmt.Errorf("command timeout: %w", ctx.Err())
 		case resp := <-c.responseChan:
 			switch resp.Command {
 			case GW_ERROR_NTF:
@@ -349,24 +447,19 @@ func (c *Client) waitForCommandConfirm(ctx context.Context) error {
 				return fmt.Errorf("KLF-200 error: code %d", errorCode)
 
 			case GW_COMMAND_SEND_CFM:
-				sessionID, status, err := ParseCommandSendConfirm(resp.Data)
-				c.logger.Debug().
-					Uint16("sessionID", sessionID).
-					Uint8("status", uint8(status)).
-					Hex("data", resp.Data).
-					Msg("Received command confirmation")
+				gotSession, accepted, err := ParseCommandSendConfirm(resp.Data)
 				if err != nil {
 					return fmt.Errorf("failed to parse response: %w", err)
 				}
-				// Status 0 = accepted, Status 1 = accepted but busy (command still executes)
-				if status > 1 {
-					return fmt.Errorf("command failed with status: %d", status)
+				if gotSession != sessionID {
+					// Stale confirmation from an earlier exchange; keep waiting.
+					c.logger.Debug().Uint16("sessionID", gotSession).Msg("Ignoring confirmation for other session")
+					continue
 				}
-				if status == 1 {
-					c.logger.Debug().Msg("Command accepted (node busy)")
-				} else {
-					c.logger.Debug().Msg("Command confirmed")
+				if !accepted {
+					return fmt.Errorf("command rejected by KLF-200")
 				}
+				c.logger.Debug().Uint16("sessionID", sessionID).Msg("Command accepted")
 				return nil
 
 			default:
@@ -387,56 +480,39 @@ func (c *Client) Close(ctx context.Context, nodeID uint8) error {
 	return c.SetPosition(ctx, nodeID, 100)
 }
 
-// Stop stops a node's movement
+// Stop stops a node's movement by commanding it to its current position.
 func (c *Client) Stop(ctx context.Context, nodeID uint8) error {
-	if !c.authenticated.Load() {
-		return fmt.Errorf("not authenticated")
-	}
-
-	c.exchangeMu.Lock()
-	defer c.exchangeMu.Unlock()
-
-	sessionID := uint16(c.sessionID.Add(1))
-
 	c.logger.Debug().Uint8("node", nodeID).Msg("Stopping node")
-
-	// Use current position to stop
-	frame := BuildCommandSendRequest(
-		sessionID,
-		1,
-		PriorityUserLevel2,
-		[]uint8{nodeID},
-		PositionCurrent, // Keep current = stop
-		nil,
-	)
-
-	if err := c.sendRaw(frame); err != nil {
-		return fmt.Errorf("failed to send command: %w", err)
-	}
-
-	// Wait for confirmation so errors are surfaced and the CFM is not left
-	// dangling in the response channel for a later exchange to misread.
-	return c.waitForCommandConfirm(ctx)
+	return c.sendMainParameter(ctx, nodeID, PositionCurrent)
 }
 
-// GetLimitationStatus requests the limitation status for nodes (sensor data).
-//
-// The resulting GW_LIMITATION_STATUS_NTF notifications are async and are
-// handled directly in readLoop (see isAsyncNotification -> updateSensorStatus),
-// so they never reach responseChan. This method therefore only sends the
-// request, waits for the confirmation, and then allows a short grace period for
-// the notifications to be processed before returning.
+// GetLimitationStatus requests the limitation status for the given nodes and
+// processes the resulting GW_LIMITATION_STATUS_NTF notifications (which
+// update the sensor status). Nodes are queried in chunks of 20.
 func (c *Client) GetLimitationStatus(ctx context.Context, nodeIDs []uint8) error {
 	if !c.authenticated.Load() {
 		return fmt.Errorf("not authenticated")
 	}
 
+	for start := 0; start < len(nodeIDs); start += MaxNodesPerRequest {
+		end := start + MaxNodesPerRequest
+		if end > len(nodeIDs) {
+			end = len(nodeIDs)
+		}
+		if err := c.getLimitationStatusChunk(ctx, nodeIDs[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) getLimitationStatusChunk(ctx context.Context, nodeIDs []uint8) error {
 	c.exchangeMu.Lock()
 	defer c.exchangeMu.Unlock()
 
 	sessionID := uint16(c.sessionID.Add(1))
 
-	c.logger.Debug().Interface("nodes", nodeIDs).Msg("Getting limitation status")
+	c.logger.Debug().Interface("nodes", nodeIDs).Uint16("sessionID", sessionID).Msg("Getting limitation status")
 
 	frame := BuildGetLimitationStatusRequest(sessionID, nodeIDs, 0) // 0 = min limitation
 	if err := c.sendRaw(frame); err != nil {
@@ -444,48 +520,83 @@ func (c *Client) GetLimitationStatus(ctx context.Context, nodeIDs []uint8) error
 	}
 
 	// Wait for confirmation
-	if _, err := c.waitForResponse(ctx, GW_GET_LIMITATION_STATUS_CFM, 5*time.Second); err != nil {
+	cfm, err := c.waitForResponse(ctx, GW_GET_LIMITATION_STATUS_CFM, 5*time.Second)
+	if err != nil {
 		return fmt.Errorf("failed to get confirmation: %w", err)
 	}
-
-	// Allow the async GW_LIMITATION_STATUS_NTF notifications to be processed.
-	select {
-	case <-ctx.Done():
-	case <-time.After(1 * time.Second):
+	// Status: 0 = rejected, 1 = accepted
+	if len(cfm.Data) >= 3 && cfm.Data[2] != 1 {
+		return fmt.Errorf("limitation status request rejected by KLF-200")
 	}
 
-	return nil
+	// Consume one GW_LIMITATION_STATUS_NTF per requested node. Each one is
+	// dispatched through handleAsyncFrame, which updates the sensor status.
+	// (GW_SESSION_FINISHED_NTF is handled asynchronously and not relied upon.)
+	received := 0
+	for {
+		resp, err := c.waitForResponse(ctx, 0, 3*time.Second)
+		if err != nil {
+			if received > 0 {
+				// Some gateways do not send GW_SESSION_FINISHED_NTF for this request.
+				return nil
+			}
+			return fmt.Errorf("no limitation status received: %w", err)
+		}
+
+		if resp.Command == GW_LIMITATION_STATUS_NTF {
+			received++
+		}
+		c.handleAsyncFrame(resp)
+		if received >= len(nodeIDs) {
+			return nil
+		}
+	}
 }
 
-// updateSensorStatus updates the internal sensor status based on limitation data
-func (c *Client) updateSensorStatus(status *LimitationStatus) {
+// setNodeLimitation records the limitation originator for a node (or clears
+// it when origin is 0) and recomputes the aggregated rain/wind status.
+func (c *Client) setNodeLimitation(nodeID uint8, origin LimitationOriginator) {
 	c.sensorStatusMu.Lock()
 
 	oldRain := c.sensorStatus.RainDetected
 	oldWind := c.sensorStatus.WindDetected
 
+	switch origin {
+	case LimitationOriginatorRain, LimitationOriginatorWind:
+		c.nodeLimitations[nodeID] = origin
+	default:
+		delete(c.nodeLimitations, nodeID)
+	}
+
+	rain, wind := false, false
+	for _, o := range c.nodeLimitations {
+		switch o {
+		case LimitationOriginatorRain:
+			rain = true
+		case LimitationOriginatorWind:
+			wind = true
+		}
+	}
+	c.sensorStatus.RainDetected = rain
+	c.sensorStatus.WindDetected = wind
 	c.sensorStatus.LastUpdate = time.Now()
 
-	switch status.LimitationOrigin {
-	case LimitationTypeRain:
-		c.sensorStatus.RainDetected = true
-	case LimitationTypeWind:
-		c.sensorStatus.WindDetected = true
-	}
-
-	// If no limitation, sensors are clear
-	if status.LimitationOrigin == LimitationTypeNone {
-		c.sensorStatus.RainDetected = false
-		c.sensorStatus.WindDetected = false
-	}
-
-	changed := oldRain != c.sensorStatus.RainDetected || oldWind != c.sensorStatus.WindDetected
+	changed := oldRain != rain || oldWind != wind
 	statusCopy := c.sensorStatus
 	c.sensorStatusMu.Unlock()
 
 	if changed && c.onSensorUpdate != nil {
 		c.onSensorUpdate(statusCopy)
 	}
+}
+
+// updateSensorStatus updates the internal sensor status based on limitation data
+func (c *Client) updateSensorStatus(status *LimitationStatus) {
+	origin := status.LimitationOrigin
+	if !status.Active() {
+		origin = 0
+	}
+	c.setNodeLimitation(status.NodeID, origin)
 }
 
 // GetSensorStatus returns the current sensor status
@@ -495,19 +606,18 @@ func (c *Client) GetSensorStatus() SensorStatus {
 	return c.sensorStatus
 }
 
-// RefreshSensorStatus queries all nodes for limitation status to update sensor readings
-// Returns nil even on timeout - the sensor status will keep its last known values
+// RefreshSensorStatus queries all nodes for limitation status to update sensor readings.
 func (c *Client) RefreshSensorStatus(ctx context.Context, nodeIDs []uint8) error {
-	err := c.GetLimitationStatus(ctx, nodeIDs)
-	if err != nil {
-		// Log the error but don't fail - limitation status may not be supported
-		// by all KLF-200 firmware versions or may timeout
-		c.logger.Warn().Err(err).Msg("Sensor status refresh failed, keeping previous values")
-		// Update last update time to indicate we tried
-		c.sensorStatusMu.Lock()
-		c.sensorStatus.LastUpdate = time.Now()
-		c.sensorStatusMu.Unlock()
+	if len(nodeIDs) == 0 {
+		return nil
 	}
+	if err := c.GetLimitationStatus(ctx, nodeIDs); err != nil {
+		c.logger.Warn().Err(err).Msg("Sensor status refresh failed, keeping previous values")
+		return err
+	}
+	c.sensorStatusMu.Lock()
+	c.sensorStatus.LastUpdate = time.Now()
+	c.sensorStatusMu.Unlock()
 	return nil
 }
 
@@ -520,6 +630,7 @@ func (c *Client) sendRaw(data []byte) error {
 		return fmt.Errorf("not connected")
 	}
 
+	c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, err := c.conn.Write(data)
 	return err
 }
@@ -537,7 +648,7 @@ func (c *Client) waitForResponse(ctx context.Context, cmd CommandID, timeout tim
 			if cmd == 0 || frame.Command == cmd {
 				return frame, nil
 			}
-			// Put back other responses (or handle them)
+			// Dispatch other frames (async notifications, stale confirmations)
 			c.handleAsyncFrame(frame)
 		}
 	}
@@ -586,25 +697,17 @@ func (c *Client) handleAsyncFrame(frame *Frame) {
 			Uint8("statusReply", uint8(statusReply)).
 			Msg("Command run status notification")
 
-		// Check for sensor-related limitations
-		c.sensorStatusMu.Lock()
-		oldRain := c.sensorStatus.RainDetected
-		oldWind := c.sensorStatus.WindDetected
-		c.sensorStatus.LastUpdate = time.Now()
+		// A command limited by rain/wind tells us the sensor is active for
+		// this node; a command that completed normally tells us it is not.
 		switch statusReply {
 		case StatusReplyLimitationByRain:
-			c.sensorStatus.RainDetected = true
-			c.logger.Info().Msg("Rain sensor triggered - rain detected")
+			c.logger.Info().Uint8("nodeID", nodeID).Msg("Command limited by rain sensor")
+			c.setNodeLimitation(nodeID, LimitationOriginatorRain)
 		case StatusReplyLimitationByWind:
-			c.sensorStatus.WindDetected = true
-			c.logger.Info().Msg("Wind sensor triggered - wind detected")
-		}
-		sensorChanged := oldRain != c.sensorStatus.RainDetected || oldWind != c.sensorStatus.WindDetected
-		sensorCopy := c.sensorStatus
-		c.sensorStatusMu.Unlock()
-
-		if sensorChanged && c.onSensorUpdate != nil {
-			c.onSensorUpdate(sensorCopy)
+			c.logger.Info().Uint8("nodeID", nodeID).Msg("Command limited by wind sensor")
+			c.setNodeLimitation(nodeID, LimitationOriginatorWind)
+		case StatusReplyCommandCompletedOk:
+			c.setNodeLimitation(nodeID, 0)
 		}
 
 		// Update state based on run status
@@ -616,6 +719,8 @@ func (c *Client) handleAsyncFrame(frame *Frame) {
 			state = NodeStateErrorWhileExecution
 		case RunStatusExecutionActive:
 			state = NodeStateExecuting
+		default:
+			state = NodeStateUnknown
 		}
 		if c.onNodeUpdate != nil {
 			c.onNodeUpdate(&Node{
@@ -635,15 +740,19 @@ func (c *Client) handleAsyncFrame(frame *Frame) {
 		c.logger.Debug().
 			Uint8("nodeID", status.NodeID).
 			Str("origin", status.LimitationOrigin.String()).
+			Bool("active", status.Active()).
 			Msg("Limitation status notification")
 		c.updateSensorStatus(status)
 	}
 }
 
-// isAsyncNotification returns true if the frame is an async notification that should be handled immediately
+// isAsyncNotification returns true if the frame is an unsolicited
+// notification that is handled directly in the read loop instead of being
+// queued for a request/response exchange.
 func (c *Client) isAsyncNotification(cmd CommandID) bool {
 	switch cmd {
-	case GW_NODE_STATE_POSITION_CHANGED_NTF, GW_COMMAND_RUN_STATUS_NTF, GW_LIMITATION_STATUS_NTF:
+	case GW_NODE_STATE_POSITION_CHANGED_NTF, GW_COMMAND_RUN_STATUS_NTF,
+		GW_COMMAND_REMAINING_TIME_NTF, GW_SESSION_FINISHED_NTF:
 		return true
 	default:
 		return false
@@ -652,34 +761,31 @@ func (c *Client) isAsyncNotification(cmd CommandID) bool {
 
 // readLoop continuously reads from the TLS connection and extracts SLIP frames.
 // It uses the connection passed at startup rather than c.conn so it does not
-// race with Disconnect, which sets c.conn = nil.
+// race with Disconnect, which sets c.conn = nil. The loop ends when the
+// connection is closed (by the peer or by Disconnect).
 func (c *Client) readLoop(conn *tls.Conn) {
 	defer c.wg.Done()
 
 	buf := make([]byte, 1024)
-	var frameBuf bytes.Buffer
+	frameBuf := make([]byte, 0, 256)
 	inFrame := false
 
 	for {
-		select {
-		case <-c.stopChan:
-			return
-		default:
-		}
-
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		n, err := conn.Read(buf)
 		if err != nil {
-			if err == io.EOF {
-				c.logger.Info().Msg("Connection closed by KLF-200")
-			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				// Read timeout is normal, continue
 				continue
-			} else {
+			}
+			if errors.Is(err, io.EOF) {
+				c.logger.Info().Msg("Connection closed by KLF-200")
+			} else if !errors.Is(err, net.ErrClosed) {
 				c.logger.Error().Err(err).Msg("Read error")
 			}
-			c.handleDisconnect(err)
+			c.handleReadError(conn, err)
 			return
 		}
 
@@ -688,12 +794,12 @@ func (c *Client) readLoop(conn *tls.Conn) {
 			b := buf[i]
 
 			if b == SlipEnd {
-				if inFrame && frameBuf.Len() > 0 {
+				if inFrame && len(frameBuf) > 0 {
 					// End of frame - process it
-					frameData := make([]byte, frameBuf.Len()+2)
-					frameData[0] = SlipEnd
-					copy(frameData[1:], frameBuf.Bytes())
-					frameData[len(frameData)-1] = SlipEnd
+					frameData := make([]byte, 0, len(frameBuf)+2)
+					frameData = append(frameData, SlipEnd)
+					frameData = append(frameData, frameBuf...)
+					frameData = append(frameData, SlipEnd)
 
 					frame, err := DecodeFrame(frameData)
 					if err != nil {
@@ -715,48 +821,56 @@ func (c *Client) readLoop(conn *tls.Conn) {
 							}
 						}
 					}
-					frameBuf.Reset()
+					frameBuf = frameBuf[:0]
 				}
 				inFrame = true
 			} else if inFrame {
-				frameBuf.WriteByte(b)
+				frameBuf = append(frameBuf, b)
 			}
 		}
 	}
 }
 
-// handleDisconnect handles disconnection
-func (c *Client) handleDisconnect(err error) {
+// handleReadError is called by the read loop when its connection died. It
+// only tears down the client state if that connection is still the current
+// one; a loop that was superseded by a reconnect must not clear the flags of
+// the new connection.
+func (c *Client) handleReadError(conn *tls.Conn, err error) {
+	c.connMu.Lock()
+	if c.conn != conn {
+		c.connMu.Unlock()
+		return
+	}
+	c.conn = nil
 	c.connected.Store(false)
 	c.authenticated.Store(false)
+	c.connMu.Unlock()
+
+	conn.Close()
 
 	if c.onDisconnect != nil {
 		c.onDisconnect(err)
 	}
 }
 
-// Disconnect closes the connection
+// Disconnect closes the connection and waits for the read loop to finish.
 func (c *Client) Disconnect() error {
 	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	conn := c.conn
+	c.conn = nil
+	c.connected.Store(false)
+	c.authenticated.Store(false)
+	c.connMu.Unlock()
 
-	// Safe close of stopChan (only close if not already closed)
-	select {
-	case <-c.stopChan:
-		// Already closed
-	default:
-		close(c.stopChan)
+	var err error
+	if conn != nil {
+		err = conn.Close()
 	}
 
-	if c.conn != nil {
-		err := c.conn.Close()
-		c.conn = nil
-		c.connected.Store(false)
-		c.authenticated.Store(false)
-		return err
-	}
-
-	return nil
+	// Wait for the read loop outside the lock (it needs connMu to notice
+	// that it has been superseded).
+	c.wg.Wait()
+	return err
 }
 
 // IsConnected returns true if connected
@@ -767,9 +881,4 @@ func (c *Client) IsConnected() bool {
 // IsAuthenticated returns true if authenticated
 func (c *Client) IsAuthenticated() bool {
 	return c.authenticated.Load()
-}
-
-// Wait waits for the client to finish
-func (c *Client) Wait() {
-	c.wg.Wait()
 }

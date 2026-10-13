@@ -13,36 +13,54 @@ CONFIG_DIR="/config/loxone2velux"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 LISTEN_PORT=8099
 
-if [ -f "$OPTIONS_FILE" ]; then
-    echo "Reading options from ${OPTIONS_FILE}"
-    KLF200_HOST=$(jq -r '.klf200_host // ""' "$OPTIONS_FILE" 2>/dev/null || echo "")
-    KLF200_PASSWORD=$(jq -r '.klf200_password // ""' "$OPTIONS_FILE" 2>/dev/null || echo "")
-    KLF200_PORT=$(jq -r '.klf200_port // 51200' "$OPTIONS_FILE" 2>/dev/null || echo "51200")
-    RECONNECT_INTERVAL=$(jq -r '.reconnect_interval // 30' "$OPTIONS_FILE" 2>/dev/null || echo "30")
-    REFRESH_INTERVAL=$(jq -r '.refresh_interval // 300' "$OPTIONS_FILE" 2>/dev/null || echo "300")
-    LOG_LEVEL=$(jq -r '.log_level // "info"' "$OPTIONS_FILE" 2>/dev/null || echo "info")
-    API_TOKEN=$(jq -r '.api_token // ""' "$OPTIONS_FILE" 2>/dev/null || echo "")
-else
+# opt_str NAME DEFAULT  -> JSON-quoted string (valid as a YAML double-quoted scalar,
+#                           so passwords with quotes, $ or backslashes are safe)
+# opt_num NAME DEFAULT  -> plain number
+opt_str() {
+    if [ -f "$OPTIONS_FILE" ]; then
+        jq --arg d "$2" -r ".$1 // \$d | tostring | @json" "$OPTIONS_FILE" 2>/dev/null && return
+    fi
+    printf '"%s"\n' "$2"
+}
+
+opt_num() {
+    if [ -f "$OPTIONS_FILE" ]; then
+        v=$(jq -r ".$1 // $2" "$OPTIONS_FILE" 2>/dev/null)
+        case "$v" in
+            ''|*[!0-9]*) ;;  # not a plain integer -> default
+            *) echo "$v"; return ;;
+        esac
+    fi
+    echo "$2"
+}
+
+if [ ! -f "$OPTIONS_FILE" ]; then
     echo "WARNING: Options file not found at ${OPTIONS_FILE}, using defaults"
-    KLF200_HOST=""
-    KLF200_PASSWORD=""
-    KLF200_PORT=51200
-    RECONNECT_INTERVAL=30
-    REFRESH_INTERVAL=300
-    LOG_LEVEL="info"
-    API_TOKEN=""
 fi
 
-echo "KLF-200 host: ${KLF200_HOST}:${KLF200_PORT}"
-echo "Server listening on: 0.0.0.0:${LISTEN_PORT}"
+KLF200_HOST=$(opt_str klf200_host "")
+KLF200_PASSWORD=$(opt_str klf200_password "")
+KLF200_PORT=$(opt_num klf200_port 51200)
+RECONNECT_INTERVAL=$(opt_num reconnect_interval 30)
+REFRESH_INTERVAL=$(opt_num refresh_interval 300)
+LOG_LEVEL=$(opt_str log_level "info")
+API_TOKEN=$(opt_str api_token "")
 
-# Always (re)generate config from HA options to avoid stale/corrupt state
+echo "KLF-200 host: $(printf %s "$KLF200_HOST" | sed 's/^"//;s/"$//'):${KLF200_PORT}"
+echo "Server listening on: 0.0.0.0:${LISTEN_PORT}"
+if [ "$API_TOKEN" = '""' ]; then
+    echo "WARNING: api_token is empty - the REST API on port ${LISTEN_PORT} is reachable without authentication"
+fi
+
+# Always (re)generate config from HA options to avoid stale/corrupt state.
+# Mappings and UDP feedback live in loxone.yaml next to it and are not touched.
 mkdir -p "${CONFIG_DIR}"
+umask 077
 cat > "${CONFIG_FILE}" << EOF
 klf200:
-  host: "${KLF200_HOST}"
+  host: ${KLF200_HOST}
   port: ${KLF200_PORT}
-  password: "${KLF200_PASSWORD}"
+  password: ${KLF200_PASSWORD}
   reconnect_interval: ${RECONNECT_INTERVAL}s
   refresh_interval: ${REFRESH_INTERVAL}s
 
@@ -51,10 +69,10 @@ server:
   port: ${LISTEN_PORT}
   read_timeout: 15s
   write_timeout: 15s
-  api_token: "${API_TOKEN}"
+  api_token: ${API_TOKEN}
 
 logging:
-  level: "${LOG_LEVEL}"
+  level: ${LOG_LEVEL}
   format: "console"
 EOF
 

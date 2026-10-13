@@ -14,6 +14,7 @@ import {
   X,
   Server,
   PlugZap,
+  KeyRound,
 } from 'lucide-react';
 
 
@@ -29,6 +30,18 @@ export function Dashboard() {
   const [sensorsRefreshing, setSensorsRefreshing] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Token prompt: shown when the gateway answers 401
+  const [authRequired, setAuthRequired] = useState(false);
+  const [tokenInput, setTokenInput] = useState('');
+
+  const handleError = useCallback((err: unknown, fallback: string) => {
+    if (err instanceof api.AuthError) {
+      setAuthRequired(true);
+      setError(null);
+      return;
+    }
+    setError(err instanceof Error ? err.message : fallback);
+  }, []);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -37,19 +50,35 @@ export function Dashboard() {
     try {
       const [healthData, nodesData, sensorData] = await Promise.all([
         api.getHealth(),
-        api.getNodes().catch(() => ({ nodes: [], count: 0 })),
-        api.getSensorStatus().catch(() => null),
+        api.getNodes(),
+        api.getSensorStatus().catch((err) => {
+          if (err instanceof api.AuthError) throw err;
+          return null;
+        }),
       ]);
 
       setHealth(healthData);
       setNodes(nodesData.nodes || []);
       if (sensorData) setSensors(sensorData);
+      setAuthRequired(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Fehler beim Laden');
+      handleError(err, 'Fehler beim Laden');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [handleError]);
+
+  const handleTokenSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    api.setToken(tokenInput.trim());
+    setTokenInput('');
+    fetchData();
+  };
+
+  const handleTokenClear = () => {
+    api.setToken('');
+    setAuthRequired(true);
+  };
 
   const handleRefreshSensors = async () => {
     setSensorsRefreshing(true);
@@ -57,7 +86,7 @@ export function Dashboard() {
       const sensorData = await api.refreshSensorStatus();
       setSensors(sensorData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Sensor-Abfrage fehlgeschlagen');
+      handleError(err, 'Sensor-Abfrage fehlgeschlagen');
     } finally {
       setSensorsRefreshing(false);
     }
@@ -74,7 +103,7 @@ export function Dashboard() {
       // Refresh data after reconnect
       setTimeout(fetchData, 1000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Fehler beim Neuverbinden');
+      handleError(err, 'Fehler beim Neuverbinden');
     } finally {
       setReconnecting(false);
     }
@@ -86,37 +115,37 @@ export function Dashboard() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
+  // Optimistic position update (functional update so concurrent polls are not overwritten)
+  const applyPosition = (id: number, position: number) => {
+    setNodes((current) =>
+      current.map((n) => (n.id === id ? { ...n, position_percent: position } : n))
+    );
+  };
+
   const handleSetPosition = async (id: number, position: number) => {
     try {
       await api.setNodePosition(id, position);
-      // Optimistic update
-      setNodes(nodes.map(n =>
-        n.id === id ? { ...n, position_percent: position } : n
-      ));
+      applyPosition(id, position);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Fehler');
+      handleError(err, 'Fehler');
     }
   };
 
   const handleOpen = async (id: number) => {
     try {
       await api.openNode(id);
-      setNodes(nodes.map(n =>
-        n.id === id ? { ...n, position_percent: 0 } : n
-      ));
+      applyPosition(id, 0);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Fehler');
+      handleError(err, 'Fehler');
     }
   };
 
   const handleClose = async (id: number) => {
     try {
       await api.closeNode(id);
-      setNodes(nodes.map(n =>
-        n.id === id ? { ...n, position_percent: 100 } : n
-      ));
+      applyPosition(id, 100);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Fehler');
+      handleError(err, 'Fehler');
     }
   };
 
@@ -124,7 +153,7 @@ export function Dashboard() {
     try {
       await api.stopNode(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Fehler');
+      handleError(err, 'Fehler');
     }
   };
 
@@ -169,6 +198,17 @@ export function Dashboard() {
                   {isConnected ? 'Verbunden' : 'Getrennt'}
                 </span>
               </div>
+
+              {/* Token Button (only shown when a token is stored) */}
+              {api.getToken() && (
+                <button
+                  onClick={handleTokenClear}
+                  className="p-2 text-gray-400 hover:text-white transition-colors"
+                  title="API-Token ändern"
+                >
+                  <KeyRound size={20} />
+                </button>
+              )}
 
               {/* Reconnect Button */}
               <button
@@ -259,6 +299,32 @@ export function Dashboard() {
           )}
         </div>
       </header>
+
+      {/* Token Prompt */}
+      {authRequired && (
+        <div className="bg-amber-900/30 border-b border-amber-500 px-4 py-3">
+          <form onSubmit={handleTokenSubmit} className="max-w-6xl mx-auto flex flex-col sm:flex-row sm:items-center gap-3">
+            <p className="text-amber-300 text-sm flex-1">
+              Das Gateway verlangt einen API-Token (Add-on-Einstellung <code className="bg-gray-900 px-1 rounded">api_token</code>).
+            </p>
+            <input
+              type="password"
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              placeholder="API-Token"
+              autoComplete="off"
+              className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white w-full sm:w-72"
+            />
+            <button
+              type="submit"
+              disabled={tokenInput.trim().length === 0}
+              className="bg-velux-blue text-white text-sm px-4 py-1.5 rounded-lg disabled:opacity-50"
+            >
+              Speichern
+            </button>
+          </form>
+        </div>
+      )}
 
       {/* Error Banner */}
       {error && (

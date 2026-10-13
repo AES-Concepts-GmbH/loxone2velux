@@ -1,12 +1,20 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ErrValidation is wrapped by every validation error so callers can map it
+// to a client error (HTTP 400) instead of a server error.
+var ErrValidation = errors.New("invalid configuration")
+
+// MinAPITokenLength is the minimum length of a configured API token.
+const MinAPITokenLength = 16
 
 // Config holds the application configuration
 type Config struct {
@@ -66,7 +74,7 @@ type NodeMapping struct {
 func DefaultConfig() *Config {
 	return &Config{
 		KLF200: KLF200Config{
-			Host:              "192.168.1.100",
+			Host:              "",
 			Port:              51200,
 			Password:          "",
 			ReconnectInterval: 30 * time.Second,
@@ -94,7 +102,8 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Load loads configuration from a YAML file
+// Load loads configuration from a YAML file. A missing file is reported with
+// an error that satisfies errors.Is(err, fs.ErrNotExist).
 func Load(path string) (*Config, error) {
 	cfg := DefaultConfig()
 
@@ -108,39 +117,99 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
+		return nil, err
 	}
 
 	return cfg, nil
 }
 
-// LoadOrDefault loads configuration from file or returns defaults
-func LoadOrDefault(path string) *Config {
-	cfg, err := Load(path)
-	if err != nil {
-		return DefaultConfig()
+// ApplyEnv overrides KLF-200 host and password from the environment
+// (KLF200_HOST, KLF200_PASSWORD) when set.
+func (c *Config) ApplyEnv() {
+	if host := os.Getenv("KLF200_HOST"); host != "" {
+		c.KLF200.Host = host
 	}
-	return cfg
+	if password := os.Getenv("KLF200_PASSWORD"); password != "" {
+		c.KLF200.Password = password
+	}
+}
+
+func validationError(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrValidation, fmt.Sprintf(format, args...))
+}
+
+// IsValidationError reports whether err originates from configuration validation.
+func IsValidationError(err error) bool {
+	return errors.Is(err, ErrValidation)
+}
+
+var validLogLevels = map[string]bool{
+	"trace": true, "debug": true, "info": true, "warn": true, "error": true, "fatal": true, "panic": true,
 }
 
 // Validate validates the configuration (allows missing KLF200 credentials for initial setup)
 func (c *Config) Validate() error {
 	if c.KLF200.Port <= 0 || c.KLF200.Port > 65535 {
-		return fmt.Errorf("klf200.port must be between 1 and 65535")
+		return validationError("klf200.port must be between 1 and 65535")
+	}
+	if c.KLF200.ReconnectInterval <= 0 {
+		return validationError("klf200.reconnect_interval must be positive")
+	}
+	if c.KLF200.RefreshInterval <= 0 {
+		return validationError("klf200.refresh_interval must be positive")
 	}
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
-		return fmt.Errorf("server.port must be between 1 and 65535")
+		return validationError("server.port must be between 1 and 65535")
 	}
 	// API token is optional - if not set, no authentication required
-	if c.Server.APIToken != "" && len(c.Server.APIToken) < 16 {
-		return fmt.Errorf("server.api_token must be at least 16 characters if set")
+	if c.Server.APIToken != "" && len(c.Server.APIToken) < MinAPITokenLength {
+		return validationError("server.api_token must be at least %d characters if set", MinAPITokenLength)
 	}
-	if c.Loxone.UDPFeedback.Enabled {
-		if c.Loxone.UDPFeedback.IP == "" {
-			return fmt.Errorf("loxone.udp_feedback.ip is required when UDP feedback is enabled")
+	if c.Logging.Level != "" && !validLogLevels[c.Logging.Level] {
+		return validationError("logging.level %q is not one of debug, info, warn, error", c.Logging.Level)
+	}
+	if c.Logging.Format != "" && c.Logging.Format != "json" && c.Logging.Format != "console" {
+		return validationError("logging.format must be \"json\" or \"console\"")
+	}
+	return c.Loxone.Validate()
+}
+
+// Validate validates the Loxone integration settings.
+func (l *LoxoneConfig) Validate() error {
+	if l.UDPFeedback.Enabled {
+		if l.UDPFeedback.IP == "" {
+			return validationError("loxone.udp_feedback.ip is required when UDP feedback is enabled")
 		}
-		if c.Loxone.UDPFeedback.Port <= 0 || c.Loxone.UDPFeedback.Port > 65535 {
-			return fmt.Errorf("loxone.udp_feedback.port must be between 1 and 65535")
+		if l.UDPFeedback.Port <= 0 || l.UDPFeedback.Port > 65535 {
+			return validationError("loxone.udp_feedback.port must be between 1 and 65535")
+		}
+	}
+
+	seenID := make(map[string]bool, len(l.Mappings))
+	seenLoxoneID := make(map[string]bool, len(l.Mappings))
+	seenNodeID := make(map[uint8]string, len(l.Mappings))
+	for i, m := range l.Mappings {
+		if m.ID == "" {
+			return validationError("loxone.mappings[%d]: id is required", i)
+		}
+		if seenID[m.ID] {
+			return validationError("loxone.mappings: duplicate id %q", m.ID)
+		}
+		seenID[m.ID] = true
+
+		if m.LoxoneID == "" {
+			return validationError("loxone.mappings[%d]: loxone_id is required", i)
+		}
+		if seenLoxoneID[m.LoxoneID] {
+			return validationError("loxone.mappings: loxone_id %q is used more than once", m.LoxoneID)
+		}
+		seenLoxoneID[m.LoxoneID] = true
+
+		if m.Enabled {
+			if other, ok := seenNodeID[m.NodeID]; ok {
+				return validationError("loxone.mappings: node %d is mapped twice (%q and %q)", m.NodeID, other, m.LoxoneID)
+			}
+			seenNodeID[m.NodeID] = m.LoxoneID
 		}
 	}
 	return nil
@@ -151,6 +220,16 @@ func (c *Config) IsKLF200Configured() bool {
 	return c.KLF200.Host != "" && c.KLF200.Password != ""
 }
 
+// writeFilePrivate writes data to path with owner-only permissions, since the
+// configuration files contain the KLF-200 password and the API token.
+func writeFilePrivate(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	// WriteFile only applies the mode to newly created files.
+	return os.Chmod(path, 0o600)
+}
+
 // Save saves the configuration to a YAML file
 func (c *Config) Save(path string) error {
 	data, err := yaml.Marshal(c)
@@ -158,7 +237,7 @@ func (c *Config) Save(path string) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeFilePrivate(path, data); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -190,6 +269,12 @@ func LoadLoxoneConfig(path string) (*LoxoneConfig, error) {
 	if err := yaml.Unmarshal(data, &lc); err != nil {
 		return nil, fmt.Errorf("failed to parse loxone config: %w", err)
 	}
+	if lc.Mappings == nil {
+		lc.Mappings = []NodeMapping{}
+	}
+	if err := lc.Validate(); err != nil {
+		return nil, err
+	}
 
 	return &lc, nil
 }
@@ -201,7 +286,7 @@ func SaveLoxoneConfig(path string, lc *LoxoneConfig) error {
 		return fmt.Errorf("failed to marshal loxone config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeFilePrivate(path, data); err != nil {
 		return fmt.Errorf("failed to write loxone config: %w", err)
 	}
 

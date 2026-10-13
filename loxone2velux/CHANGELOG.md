@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0
+
+Korrekturen aus dem Code-Review:
+
+- Fix: KLF-200-Protokoll – `GW_COMMAND_RUN_STATUS_NTF` wurde an falschen Byte-Offsets gelesen (Run-Status/Status-Reply)
+- Fix: KLF-200-Protokoll – Command-IDs für Limitation-Status (`0x0312`–`0x0314`), Originator-Werte (Regen = 2, Wind = 9) und Sonderwert für Stop (`0xD200`) korrigiert; Regen-/Windsensor funktioniert damit erstmals korrekt
+- Fix: `GW_COMMAND_SEND_CFM` Status 0 bedeutet "abgelehnt" und wird jetzt als Fehler gemeldet
+- Fix: Node-Typ-Tabelle an die Spezifikation angepasst (Fensteröffner, Rollläden, Markisen usw. werden korrekt benannt), unbekannte Subtypen fallen auf den Basistyp zurück
+- Sicherheit: TLS-Zertifikat des KLF-200 wird jetzt tatsächlich gegen die Velux-CA geprüft (bisher wirkungslos); abgelaufene Velux-CA wird toleriert
+- Sicherheit: `GET /api/config` gibt Passwort und API-Token nicht mehr zurück; Konfigdateien werden mit `0600` geschrieben; Warnung im Log, wenn kein API-Token gesetzt ist
+- Fix: Web-UI funktioniert mit gesetztem API-Token (Token-Eingabe im Dashboard, wird im Browser gespeichert)
+- Fix: API-Token- und Log-Level-Änderungen über `POST /api/config` wirken sofort statt erst nach Neustart
+- Fix: Fallback auf Umgebungsvariablen (`KLF200_HOST`, `KLF200_PASSWORD`) ohne Konfigdatei funktioniert jetzt
+- Fix: Reconnect-Race, bei der eine alte Lese-Schleife die neue Verbindung als getrennt markierte
+- Fix: Hintergrund-Loops starten auch ohne KLF-200-Konfiguration, spätere Konfiguration per API wird vollständig übernommen
+- Fix: unvollständige Node-Listen bei Timeout ersetzen den Cache nicht mehr
+- Neu: Keep-alive (`GW_GET_STATE_REQ`) alle 60 s, tote Verbindungen werden erkannt und neu aufgebaut
+- Neu: Sensorstatus wird pro Node gehalten und beim periodischen Refresh mit aktualisiert
+- Neu: Mappings werden validiert (doppelte IDs, doppelte Loxone-IDs, doppelt gemappte Nodes → HTTP 400)
+- Add-on: Passwort/Token werden JSON-escaped in die Konfiguration geschrieben; Build verwendet das Git-Tag `v<version>`, sofern vorhanden
+- Add-on: `api_token` muss leer oder mindestens 16 Zeichen lang sein (Schema)
+- Doku: Port 8099, UDP-Feedback und Mapping-API dokumentiert; README und LICENSE ergänzt
+- Intern: Unit-Tests für Protokoll, Konfiguration und Mappings; CI-Workflow; ungenutzte Abhängigkeiten und Code entfernt; `package-lock.json` für reproduzierbare Frontend-Builds
+
 ## 1.2.0
 
 - Fix: Positionsanzeige/UDP-Feedback wurde nach Run-Status-Meldungen fälschlich auf 0 % gesetzt

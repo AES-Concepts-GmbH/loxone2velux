@@ -27,5 +27,9 @@ config.yaml
 # Docker image export
 *.tar
 
+# Frontend build output and dependencies
+web/node_modules/
+web/dist/
+
 # Claude Code
 .claude/
