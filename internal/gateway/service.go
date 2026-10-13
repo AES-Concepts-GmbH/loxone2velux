@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"math"
@@ -22,12 +23,16 @@ var ErrNotConfigured = errors.New("KLF-200 not configured (host or password miss
 // KLF-200 session.
 var ErrNotConnected = errors.New("not connected to KLF-200")
 
-const (
-	// keepAliveInterval is how often GW_GET_STATE_REQ is sent on an idle
-	// connection. The KLF-200 drops connections without traffic; pyvlx uses
-	// 30s, we stay below the gateway's limit with a little more headroom.
-	keepAliveInterval = 60 * time.Second
+// keepAliveInterval is how often GW_GET_STATE_REQ is sent on an idle
+// connection. The KLF-200 drops connections without traffic; pyvlx uses
+// 30s, we stay below the gateway's limit with a little more headroom.
+// (Variable so tests can shorten it.)
+var keepAliveInterval = 60 * time.Second
 
+// keepAliveTimeout bounds a single keep-alive exchange.
+var keepAliveTimeout = 10 * time.Second
+
+const (
 	// keepAliveFailuresBeforeDrop is the number of consecutive keep-alive
 	// failures after which the connection is considered dead.
 	keepAliveFailuresBeforeDrop = 2
@@ -53,14 +58,26 @@ type Service struct {
 	wg              sync.WaitGroup
 }
 
+// Option customizes a Service at construction time.
+type Option func(*klf200.ClientConfig)
+
+// WithTLSConfig overrides the TLS configuration used towards the KLF-200
+// (used by tests with a simulated gateway).
+func WithTLSConfig(tlsCfg *tls.Config) Option {
+	return func(c *klf200.ClientConfig) { c.TLSConfig = tlsCfg }
+}
+
 // NewService creates a new gateway service
-func NewService(cfg *config.KLF200Config, loxoneCfg *config.LoxoneConfig, logger zerolog.Logger) *Service {
+func NewService(cfg *config.KLF200Config, loxoneCfg *config.LoxoneConfig, logger zerolog.Logger, opts ...Option) *Service {
 	cfgCopy := *cfg
 	clientCfg := klf200.ClientConfig{
 		Host:     cfg.Host,
 		Port:     cfg.Port,
 		Password: cfg.Password,
 		Logger:   logger.With().Str("component", "klf200-client").Logger(),
+	}
+	for _, opt := range opts {
+		opt(&clientCfg)
 	}
 
 	udpSender := loxone.NewUDPSender(logger)
@@ -256,7 +273,7 @@ func (s *Service) keepAliveLoop() {
 				failures = 0
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), keepAliveTimeout)
 			err := s.client.GetState(ctx)
 			cancel()
 			if err == nil {

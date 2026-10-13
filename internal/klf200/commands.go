@@ -416,15 +416,6 @@ func ParseRunStatusNotification(data []byte) (sessionID uint16, nodeID uint8, ru
 	return sessionID, nodeID, runStatus, statusReply, nil
 }
 
-// ParseSessionID extracts the leading 2-byte session ID of a frame payload
-// (GW_SESSION_FINISHED_NTF, GW_GET_LIMITATION_STATUS_CFM, ...).
-func ParseSessionID(data []byte) (uint16, error) {
-	if len(data) < 2 {
-		return 0, ErrFrameTooShort
-	}
-	return binary.BigEndian.Uint16(data[0:2]), nil
-}
-
 // BuildGetLimitationStatusRequest creates a request to get limitation status for nodes
 // Frame structure:
 // - SessionID: 2 bytes

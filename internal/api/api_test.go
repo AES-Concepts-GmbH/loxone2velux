@@ -17,8 +17,9 @@ import (
 
 // memConfigManager is an in-memory ConfigManager for tests.
 type memConfigManager struct {
-	mu  sync.Mutex
-	cfg *config.Config
+	mu      sync.Mutex
+	cfg     *config.Config
+	gateway *gateway.Service // optional: receives UDP/mapping updates
 }
 
 func (m *memConfigManager) GetConfig() *config.Config {
@@ -40,10 +41,26 @@ func (m *memConfigManager) UpdateConfig(cfg *config.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cfg = cfg
+	if m.gateway != nil {
+		if err := m.gateway.GetUDPSender().Configure(cfg.Loxone.UDPFeedback); err != nil {
+			return err
+		}
+		m.gateway.GetMappingManager().Load(cfg.Loxone.Mappings)
+	}
 	return nil
 }
 
 func (m *memConfigManager) GetConfigPath() string { return "" }
+
+// httpGet returns the status code of a GET request.
+func httpGet(url string) (int, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	resp.Body.Close()
+	return resp.StatusCode, nil
+}
 
 func newTestServer(t *testing.T, token string) (*httptest.Server, *memConfigManager) {
 	t.Helper()
