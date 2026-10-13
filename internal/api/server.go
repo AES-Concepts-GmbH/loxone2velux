@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
-	"io/fs"
+	"html"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,8 +30,9 @@ type Server struct {
 
 // NewServer creates a new API server
 func NewServer(cfg *config.ServerConfig, gw *gateway.Service, logger zerolog.Logger, configMgr ConfigManager, version string) *Server {
+	cfgCopy := *cfg
 	return &Server{
-		cfg:       cfg,
+		cfg:       &cfgCopy,
 		gateway:   gw,
 		logger:    logger.With().Str("component", "api").Logger(),
 		configMgr: configMgr,
@@ -46,10 +47,11 @@ func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 
 	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      router,
-		ReadTimeout:  s.cfg.ReadTimeout,
-		WriteTimeout: s.cfg.WriteTimeout,
+		Addr:              addr,
+		Handler:           router,
+		ReadTimeout:       s.cfg.ReadTimeout,
+		ReadHeaderTimeout: s.cfg.ReadTimeout,
+		WriteTimeout:      s.cfg.WriteTimeout,
 	}
 
 	s.logger.Info().Str("addr", addr).Msg("Starting HTTP server")
@@ -64,7 +66,18 @@ func (s *Server) Start() error {
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info().Msg("Shutting down HTTP server")
+	if s.server == nil {
+		return nil
+	}
 	return s.server.Shutdown(ctx)
+}
+
+// apiToken returns the currently configured API token ("" = no auth).
+func (s *Server) apiToken() string {
+	if s.configMgr != nil {
+		return s.configMgr.GetAPIToken()
+	}
+	return s.cfg.APIToken
 }
 
 // setupRoutes configures the HTTP routes
@@ -91,29 +104,29 @@ func (s *Server) setupRoutes() *chi.Mux {
 	})
 	r.Use(NewLoggingMiddleware(s.logger))
 	r.Use(chimiddleware.Recoverer)
-	r.Use(chimiddleware.Timeout(30 * time.Second))
+	// The request context deadline must not exceed the server's write timeout,
+	// otherwise the connection is cut before the handler can answer.
+	requestTimeout := s.cfg.WriteTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = 15 * time.Second
+	}
+	r.Use(chimiddleware.Timeout(requestTimeout))
 
 	// Handlers
 	h := NewHandlers(s.gateway, s.logger, s.configMgr, s.version)
+	auth := NewTokenAuthMiddleware(s.apiToken, s.logger)
 
 	// Public routes (no auth required)
 	r.Get("/health", h.Health)
 
 	// Auth status endpoint - tells frontend if auth is required
 	r.Get("/api/auth/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if s.cfg.APIToken == "" {
-			w.Write([]byte(`{"required":false}`))
-		} else {
-			w.Write([]byte(`{"required":true}`))
-		}
+		writeJSON(w, http.StatusOK, map[string]bool{"required": s.apiToken() != ""})
 	})
 
 	// API routes - protected only if token is configured
 	r.Route("/api", func(r chi.Router) {
-		if s.cfg.APIToken != "" {
-			r.Use(NewTokenAuthMiddleware(s.cfg.APIToken, s.logger))
-		}
+		r.Use(auth)
 		r.Route("/nodes", func(r chi.Router) {
 			r.Get("/", h.ListNodes)
 			r.Get("/{nodeID}", h.GetNode)
@@ -148,9 +161,7 @@ func (s *Server) setupRoutes() *chi.Mux {
 	// Loxone-friendly endpoints - protected only if token is configured
 	// Token via query param: /loxone/node/1/open?token=YOUR_TOKEN
 	r.Route("/loxone", func(r chi.Router) {
-		if s.cfg.APIToken != "" {
-			r.Use(NewTokenAuthMiddleware(s.cfg.APIToken, s.logger))
-		}
+		r.Use(auth)
 		r.Get("/node/{nodeID}/position", h.LoxoneGetPosition)
 		r.Get("/node/{nodeID}/set/{position}", h.LoxoneSetPosition)
 		r.Get("/node/{nodeID}/open", h.LoxoneOpen)
@@ -165,29 +176,12 @@ func (s *Server) setupRoutes() *chi.Mux {
 	staticDir := "./web/dist"
 	if _, err := os.Stat(staticDir); err == nil {
 		s.logger.Info().Str("dir", staticDir).Msg("Serving static files")
+		indexPath := filepath.Join(staticDir, "index.html")
+		serveIndex := s.indexHandler(indexPath)
 
 		// Root path: serve index.html with HA Ingress base path injection.
-		// HA Ingress sends X-Ingress-Path header; we inject a <base> tag so
-		// that all relative URLs (API calls, assets) resolve correctly.
-		indexPath := filepath.Join(staticDir, "index.html")
-		r.Get("/", func(w http.ResponseWriter, req *http.Request) {
-			htmlBytes, err := os.ReadFile(indexPath)
-			if err != nil {
-				http.NotFound(w, req)
-				return
-			}
-			html := string(htmlBytes)
-			if ingressPath := req.Header.Get("X-Ingress-Path"); ingressPath != "" {
-				if !strings.HasSuffix(ingressPath, "/") {
-					ingressPath += "/"
-				}
-				html = strings.Replace(html, "<head>", `<head><base href="`+ingressPath+`" />`, 1)
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(html))
-		})
-
-		fileServer(r, "/", http.Dir(staticDir))
+		r.Get("/", serveIndex)
+		fileServer(r, http.Dir(staticDir), serveIndex)
 	} else {
 		s.logger.Debug().Msg("No static files directory found, skipping frontend")
 	}
@@ -195,62 +189,50 @@ func (s *Server) setupRoutes() *chi.Mux {
 	return r
 }
 
-// fileServer sets up a http.FileServer handler to serve static files from a directory
-func fileServer(r chi.Router, path string, root http.FileSystem) {
-	if strings.ContainsAny(path, "{}*") {
-		panic("FileServer does not permit URL parameters.")
+// indexHandler serves index.html. HA Ingress sends an X-Ingress-Path header;
+// we inject a <base> tag so that all relative URLs (API calls, assets)
+// resolve correctly behind the proxy. The header value is HTML-escaped
+// before it is written into the page.
+func (s *Server) indexHandler(indexPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		htmlBytes, err := os.ReadFile(indexPath)
+		if err != nil {
+			http.NotFound(w, req)
+			return
+		}
+		page := string(htmlBytes)
+		if ingressPath := req.Header.Get("X-Ingress-Path"); ingressPath != "" && strings.HasPrefix(ingressPath, "/") {
+			if !strings.HasSuffix(ingressPath, "/") {
+				ingressPath += "/"
+			}
+			page = strings.Replace(page, "<head>", `<head><base href="`+html.EscapeString(ingressPath)+`" />`, 1)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(page))
 	}
+}
 
-	if path != "/" && path[len(path)-1] != '/' {
-		r.Get(path, http.RedirectHandler(path+"/", http.StatusMovedPermanently).ServeHTTP)
-		path += "/"
-	}
-	path += "*"
+// fileServer serves the static frontend files from root. Unknown paths fall
+// back to the SPA index page.
+func fileServer(r chi.Router, root http.FileSystem, serveIndex http.HandlerFunc) {
+	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
+		fsPath := req.URL.Path
 
-	r.Get(path, func(w http.ResponseWriter, r *http.Request) {
-		rctx := chi.RouteContext(r.Context())
-		pathPrefix := strings.TrimSuffix(rctx.RoutePattern(), "/*")
-		fsPath := strings.TrimPrefix(r.URL.Path, pathPrefix)
-
-		// Try to open the file
 		f, err := root.Open(fsPath)
 		if err != nil {
 			// If file not found, serve index.html for SPA routing
-			if os.IsNotExist(err) {
-				indexPath := filepath.Join(".", "index.html")
-				if f, err = root.Open(indexPath); err != nil {
-					http.NotFound(w, r)
-					return
-				}
-			} else {
-				http.NotFound(w, r)
-				return
-			}
+			serveIndex(w, req)
+			return
 		}
 		defer f.Close()
 
-		// Check if it's a directory
 		stat, err := f.Stat()
-		if err != nil {
-			http.NotFound(w, r)
+		if err != nil || stat.IsDir() {
+			serveIndex(w, req)
 			return
 		}
 
-		if stat.IsDir() {
-			// Try to serve index.html from directory
-			indexPath := filepath.Join(fsPath, "index.html")
-			if f, err = root.Open(indexPath); err != nil {
-				http.NotFound(w, r)
-				return
-			}
-			defer f.Close()
-			stat, _ = f.Stat()
-		}
-
-		// Serve the file
-		http.ServeContent(w, r, stat.Name(), stat.ModTime(), f.(fs.File).(interface {
-			Seek(offset int64, whence int) (int64, error)
-			Read(p []byte) (n int, err error)
-		}).(http.File))
+		http.ServeContent(w, req, stat.Name(), stat.ModTime(), f)
 	})
 }

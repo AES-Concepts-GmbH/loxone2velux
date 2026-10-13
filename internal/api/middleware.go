@@ -10,7 +10,9 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// LoggingMiddleware creates a logging middleware
+// NewLoggingMiddleware creates a request logging middleware. Successful GET
+// requests (health checks, UI polling) are logged at debug level to keep the
+// info log readable; everything else is logged at info level.
 func NewLoggingMiddleware(logger zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -20,11 +22,16 @@ func NewLoggingMiddleware(logger zerolog.Logger) func(http.Handler) http.Handler
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
 			defer func() {
-				logger.Info().
+				status := ww.Status()
+				event := logger.Info()
+				if r.Method == http.MethodGet && status < 400 {
+					event = logger.Debug()
+				}
+				event.
 					Str("method", r.Method).
 					Str("path", r.URL.Path).
 					Str("remote", r.RemoteAddr).
-					Int("status", ww.Status()).
+					Int("status", status).
 					Int("bytes", ww.BytesWritten()).
 					Dur("duration", time.Since(start)).
 					Str("request_id", middleware.GetReqID(r.Context())).
@@ -36,35 +43,22 @@ func NewLoggingMiddleware(logger zerolog.Logger) func(http.Handler) http.Handler
 	}
 }
 
-// CORSMiddleware adds CORS headers. The bundled web UI is served same-origin
-// (directly or via HA Ingress) and Loxone/Miniserver calls are server-side, so
-// CORS only applies to browser cross-origin requests. We reflect the request's
-// Origin (with Vary: Origin) instead of advertising a blanket "*" wildcard.
-func CORSMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Add("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization")
-		}
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// TokenAuthMiddleware creates a middleware that validates API tokens
+// NewTokenAuthMiddleware creates a middleware that validates API tokens.
+// The token is read through tokenFn on every request so that a token changed
+// at runtime takes effect immediately. An empty token disables authentication.
+//
 // Token can be provided via:
 // - Header: Authorization: Bearer <token>
-// - Query parameter: ?token=<token>
-func NewTokenAuthMiddleware(token string, logger zerolog.Logger) func(http.Handler) http.Handler {
+// - Query parameter: ?token=<token>  (for Loxone virtual outputs)
+func NewTokenAuthMiddleware(tokenFn func() string, logger zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := tokenFn()
+			if token == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			providedToken := ""
 
 			// Check Authorization header first

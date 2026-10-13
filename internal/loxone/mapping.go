@@ -30,7 +30,9 @@ func (m *MappingManager) Load(mappings []config.NodeMapping) {
 	m.byID = make(map[string]*config.NodeMapping)
 
 	for i := range mappings {
-		mapping := &mappings[i]
+		// Copy so the manager does not alias the caller's slice.
+		mapping := new(config.NodeMapping)
+		*mapping = mappings[i]
 		m.byID[mapping.ID] = mapping
 		if mapping.Enabled {
 			m.byNodeID[mapping.NodeID] = mapping

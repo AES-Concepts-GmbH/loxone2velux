@@ -1,26 +1,41 @@
 # Global build args (must be before first FROM)
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
 ARG BUILD_ARCH=amd64
+ARG BUILD_VERSION=
 
 # ============================================================
-# Stage 1: Clone source
+# Stage 1: Fetch source
 # (HA builder sets context to add-on subdir, so we need to
 #  clone the full repo to access Go/web source files)
+#
+# The add-on version (BUILD_VERSION, passed by the HA builder from
+# config.yaml) selects the git tag "v<version>". If that tag does not
+# exist the SOURCE_BRANCH is used, so an add-on build always matches
+# a released version when one is tagged.
 # ============================================================
 FROM alpine:3.19 AS source
 
 RUN apk add --no-cache git
 
 # Use custom arg names to avoid HA Supervisor overriding them
-ARG SOURCE_REPO=https://github.com/stefanbeyeler/Loxone2velux.git
+ARG SOURCE_REPO=https://github.com/stefanbeyeler/loxone2velux.git
 ARG SOURCE_BRANCH=main
+ARG BUILD_VERSION
 
 # Cache bust: COPY config.yaml from build context — changes with every
-# version bump, which invalidates this layer and the git clone below
+# version bump, which invalidates this layer and the git fetch below
 COPY config.yaml /tmp/addon-config.yaml
 
-RUN git clone --depth 1 --branch ${SOURCE_BRANCH} \
-    "${SOURCE_REPO}" /src
+RUN set -eu; \
+    git clone --depth 1 --branch "${SOURCE_BRANCH}" "${SOURCE_REPO}" /src; \
+    cd /src; \
+    if [ -n "${BUILD_VERSION}" ] && git fetch --depth 1 origin "refs/tags/v${BUILD_VERSION}:refs/tags/v${BUILD_VERSION}" 2>/dev/null; then \
+        git checkout -q "v${BUILD_VERSION}"; \
+        echo "Building from tag v${BUILD_VERSION}"; \
+    else \
+        echo "WARNING: tag v${BUILD_VERSION} not found, building from branch ${SOURCE_BRANCH}"; \
+    fi; \
+    git log -1 --format='%H %s'
 
 # ============================================================
 # Stage 2: Build frontend
@@ -28,8 +43,8 @@ RUN git clone --depth 1 --branch ${SOURCE_BRANCH} \
 FROM node:20-alpine AS frontend
 
 WORKDIR /web
-COPY --from=source /src/web/package*.json ./
-RUN npm install --no-audit --no-fund
+COPY --from=source /src/web/package.json /src/web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY --from=source /src/web/ .
 COPY --from=source /src/VERSION /tmp/VERSION
 RUN VITE_APP_VERSION=$(cat /tmp/VERSION) npm run build

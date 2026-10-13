@@ -4,8 +4,8 @@ FROM node:20-alpine AS frontend
 WORKDIR /web
 
 # Copy package files
-COPY web/package*.json ./
-RUN npm install
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 # Copy source and build
 COPY web/ .
@@ -44,7 +44,8 @@ COPY --from=builder /loxone2velux /app/loxone2velux
 # Copy frontend from frontend builder
 COPY --from=frontend /web/dist /app/web/dist
 
-# Copy example config
+# Copy example config. Without a mounted /app/config.yaml the gateway starts
+# with defaults and reads KLF200_HOST / KLF200_PASSWORD from the environment.
 COPY config.example.yaml /app/config.example.yaml
 
 # Create non-root user

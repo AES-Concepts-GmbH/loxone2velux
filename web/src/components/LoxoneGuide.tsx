@@ -5,6 +5,7 @@ import {
   Copy,
   Check,
 } from 'lucide-react';
+import { getToken } from '../services/api';
 
 interface CodeBlockProps {
   code: string;
@@ -73,8 +74,8 @@ function Accordion({ title, children, defaultOpen = false }: AccordionProps) {
 const DIRECT_PORT = 8099;
 
 export function LoxoneGuide() {
-  const token = localStorage.getItem('api_token');
-  const hasToken = token && token.length > 0;
+  const token = getToken();
+  const hasToken = token.length > 0;
   // Show token suffix only if auth is enabled
   const tokenSuffix = hasToken ? `?token=${token}` : '';
   // Gateway direct address for Loxone (not via HA Ingress)

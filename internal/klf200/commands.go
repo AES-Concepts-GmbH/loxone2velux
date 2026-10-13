@@ -10,21 +10,25 @@ import (
 
 // SLIP protocol constants
 const (
-	SlipEnd     byte = 0xC0
-	SlipEsc     byte = 0xDB
-	SlipEscEnd  byte = 0xDC
-	SlipEscEsc  byte = 0xDD
+	SlipEnd    byte = 0xC0
+	SlipEsc    byte = 0xDB
+	SlipEscEnd byte = 0xDC
+	SlipEscEsc byte = 0xDD
 )
 
 // KLF200 protocol constants
 const (
 	ProtocolID byte = 0x00 // Protocol identifier for KLF-200
+
+	// MaxNodesPerRequest is the size of the index array in command and
+	// limitation requests.
+	MaxNodesPerRequest = 20
 )
 
 var (
-	ErrInvalidFrame    = errors.New("invalid frame")
+	ErrInvalidFrame     = errors.New("invalid frame")
 	ErrChecksumMismatch = errors.New("checksum mismatch")
-	ErrFrameTooShort   = errors.New("frame too short")
+	ErrFrameTooShort    = errors.New("frame too short")
 )
 
 // EncodeFrame creates a SLIP-encoded frame from command and data
@@ -150,6 +154,11 @@ func DecodeFrame(raw []byte) (*Frame, error) {
 		return nil, fmt.Errorf("invalid protocol ID: %02x", data[0])
 	}
 
+	// Verify declared length (command + data)
+	if int(data[1]) != len(data)-2 {
+		return nil, fmt.Errorf("%w: declared length %d, actual %d", ErrInvalidFrame, data[1], len(data)-2)
+	}
+
 	// Parse frame
 	// data[0] = Protocol ID
 	// data[1] = Length (command + data length)
@@ -191,6 +200,12 @@ func BuildGetAllNodesRequest() []byte {
 	return EncodeFrame(GW_GET_ALL_NODES_INFORMATION_REQ, nil)
 }
 
+// BuildGetStateRequest creates a GW_GET_STATE_REQ frame. It carries no payload
+// and is used as a keep-alive, since the KLF-200 drops idle connections.
+func BuildGetStateRequest() []byte {
+	return EncodeFrame(GW_GET_STATE_REQ, nil)
+}
+
 // BuildCommandSendRequest creates a command to control a node
 // Frame structure (66 bytes payload per pyvlx):
 // - SessionID: 2 bytes (index 0-1)
@@ -209,6 +224,10 @@ func BuildGetAllNodesRequest() []byte {
 // Total: 66 bytes
 func BuildCommandSendRequest(sessionID uint16, commandOriginator uint8, priorityLevel Priority,
 	nodeIDs []uint8, mainParameter uint16, functionalParameters []uint16) []byte {
+
+	if len(nodeIDs) > MaxNodesPerRequest {
+		nodeIDs = nodeIDs[:MaxNodesPerRequest]
+	}
 
 	buf := new(bytes.Buffer)
 
@@ -250,7 +269,7 @@ func BuildCommandSendRequest(sessionID uint16, commandOriginator uint8, priority
 		buf.WriteByte(id)
 	}
 	// Pad to 20 nodes
-	for i := len(nodeIDs); i < 20; i++ {
+	for i := len(nodeIDs); i < MaxNodesPerRequest; i++ {
 		buf.WriteByte(0)
 	}
 
@@ -272,6 +291,7 @@ func BuildHouseStatusMonitorEnableRequest() []byte {
 }
 
 // ParsePasswordConfirm parses password confirmation response
+// Status: 0 = successful, 1 = failed
 func ParsePasswordConfirm(data []byte) (bool, error) {
 	if len(data) < 1 {
 		return false, ErrFrameTooShort
@@ -361,31 +381,48 @@ func ParseNodeStatePositionChangedFull(data []byte) (nodeID uint8, state NodeSta
 }
 
 // ParseCommandSendConfirm parses command confirmation
-func ParseCommandSendConfirm(data []byte) (sessionID uint16, status ResponseStatus, err error) {
+// Frame structure: SessionID (2 bytes), Status (1 byte: 0 = rejected, 1 = accepted)
+func ParseCommandSendConfirm(data []byte) (sessionID uint16, accepted bool, err error) {
 	if len(data) < 3 {
-		return 0, 0, ErrFrameTooShort
+		return 0, false, ErrFrameTooShort
 	}
 
 	sessionID = binary.BigEndian.Uint16(data[0:2])
-	status = ResponseStatus(data[2])
+	accepted = data[2] == 1
 
-	return sessionID, status, nil
+	return sessionID, accepted, nil
 }
 
-// ParseRunStatusNotification parses run status notification
+// ParseRunStatusNotification parses GW_COMMAND_RUN_STATUS_NTF
+// Frame structure (13 bytes):
+// - SessionID: 2 bytes @ 0
+// - StatusID: 1 byte @ 2
+// - Index (NodeID): 1 byte @ 3
+// - NodeParameter: 1 byte @ 4
+// - ParameterValue: 2 bytes @ 5
+// - RunStatus: 1 byte @ 7
+// - StatusReply: 1 byte @ 8
+// - InformationCode: 4 bytes @ 9
 func ParseRunStatusNotification(data []byte) (sessionID uint16, nodeID uint8, runStatus RunStatus, statusReply StatusReply, err error) {
 	if len(data) < 13 {
 		return 0, 0, 0, 0, ErrFrameTooShort
 	}
 
 	sessionID = binary.BigEndian.Uint16(data[0:2])
-	// Status ID at offset 2
 	nodeID = data[3]
-	// Parameter ID at offset 4
-	runStatus = RunStatus(data[5])
-	statusReply = StatusReply(data[6])
+	runStatus = RunStatus(data[7])
+	statusReply = StatusReply(data[8])
 
 	return sessionID, nodeID, runStatus, statusReply, nil
+}
+
+// ParseSessionID extracts the leading 2-byte session ID of a frame payload
+// (GW_SESSION_FINISHED_NTF, GW_GET_LIMITATION_STATUS_CFM, ...).
+func ParseSessionID(data []byte) (uint16, error) {
+	if len(data) < 2 {
+		return 0, ErrFrameTooShort
+	}
+	return binary.BigEndian.Uint16(data[0:2]), nil
 }
 
 // BuildGetLimitationStatusRequest creates a request to get limitation status for nodes
@@ -396,6 +433,10 @@ func ParseRunStatusNotification(data []byte) (sessionID uint16, nodeID uint8, ru
 // - ParameterID: 1 byte (0 = main parameter)
 // - LimitationType: 1 byte (0 = min limitation, 1 = max limitation)
 func BuildGetLimitationStatusRequest(sessionID uint16, nodeIDs []uint8, limitationType uint8) []byte {
+	if len(nodeIDs) > MaxNodesPerRequest {
+		nodeIDs = nodeIDs[:MaxNodesPerRequest]
+	}
+
 	buf := new(bytes.Buffer)
 
 	// Session ID (2 bytes)
@@ -408,7 +449,7 @@ func BuildGetLimitationStatusRequest(sessionID uint16, nodeIDs []uint8, limitati
 	for _, id := range nodeIDs {
 		buf.WriteByte(id)
 	}
-	for i := len(nodeIDs); i < 20; i++ {
+	for i := len(nodeIDs); i < MaxNodesPerRequest; i++ {
 		buf.WriteByte(0)
 	}
 
@@ -436,10 +477,11 @@ func ParseLimitationStatusNotification(data []byte) (*LimitationStatus, error) {
 	}
 
 	status := &LimitationStatus{
+		SessionID:        binary.BigEndian.Uint16(data[0:2]),
 		NodeID:           data[2],
 		MinValue:         binary.BigEndian.Uint16(data[4:6]),
 		MaxValue:         binary.BigEndian.Uint16(data[6:8]),
-		LimitationOrigin: LimitationType(data[8]),
+		LimitationOrigin: LimitationOriginator(data[8]),
 		LimitationTime:   data[9],
 	}
 
