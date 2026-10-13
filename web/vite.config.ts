@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
@@ -34,5 +35,16 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./src/test/setup.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'text-summary'],
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/main.tsx', 'src/vite-env.d.ts', 'src/test/**', 'src/**/*.test.{ts,tsx}'],
+    },
   },
 })

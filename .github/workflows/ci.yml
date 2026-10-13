@@ -25,7 +25,13 @@ jobs:
           git diff --exit-code go.mod go.sum
       - run: go vet ./...
       - run: go build ./...
-      - run: go test -race ./...
+      - name: go test (race + coverage)
+        run: go test -race -coverprofile=coverage.out -coverpkg=./... ./...
+      - name: coverage gate (70%)
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}' | tr -d '%')
+          echo "Total Go coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { if (t + 0 < 70) { print "Coverage below 70%"; exit 1 } }'
 
   frontend:
     name: Frontend build
@@ -41,6 +47,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci --no-audit --no-fund
+      - run: npm test
       - run: npm run build
 
   addon-script:

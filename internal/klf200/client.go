@@ -22,6 +22,7 @@ type Client struct {
 	port     int
 	password string
 	logger   zerolog.Logger
+	tlsCfg   *tls.Config
 
 	// conn is the active connection. It is only ever replaced while connMu
 	// is held. The read loop keeps its own reference so it can tell whether
@@ -40,7 +41,11 @@ type Client struct {
 
 	// Response channel for request/response exchanges
 	responseChan chan *Frame
-	wg           sync.WaitGroup
+
+	// readDone is closed by the read loop of the current connection when it
+	// exits. It is replaced together with conn under connMu, so Disconnect
+	// can wait for exactly the loop it is tearing down.
+	readDone chan struct{}
 
 	// exchangeMu serializes request/response exchanges that read from
 	// responseChan (Authenticate, GetAllNodes, SetPosition, Stop, GetState,
@@ -60,6 +65,11 @@ type ClientConfig struct {
 	Port     int
 	Password string
 	Logger   zerolog.Logger
+
+	// TLSConfig optionally overrides the TLS client configuration. When nil
+	// the connection is verified against the embedded Velux CA. Tests use
+	// this to talk to a simulated gateway.
+	TLSConfig *tls.Config
 }
 
 // NewClient creates a new KLF-200 client
@@ -69,6 +79,7 @@ func NewClient(cfg ClientConfig) *Client {
 		port:            cfg.Port,
 		password:        cfg.Password,
 		logger:          cfg.Logger,
+		tlsCfg:          cfg.TLSConfig,
 		responseChan:    make(chan *Frame, 100),
 		nodeLimitations: make(map[uint8]LimitationOriginator),
 	}
@@ -82,6 +93,9 @@ func (c *Client) UpdateConfig(cfg ClientConfig) {
 	c.host = cfg.Host
 	c.port = cfg.Port
 	c.password = cfg.Password
+	if cfg.TLSConfig != nil {
+		c.tlsCfg = cfg.TLSConfig
+	}
 	if cfg.Logger.GetLevel() != zerolog.Disabled {
 		c.logger = cfg.Logger
 	}
@@ -188,11 +202,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	// InsecureSkipVerify disables Go's built-in verification (which would
 	// fail on the missing hostname and the expired CA); the chain is instead
 	// verified explicitly in verifyVeluxCertificate.
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify:    true, //nolint:gosec // custom chain verification below
-		VerifyPeerCertificate: verifyVeluxCertificate,
-		MinVersion:            tls.VersionTLS12,
-		MaxVersion:            tls.VersionTLS12,
+	tlsConfig := c.tlsCfg
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify:    true, //nolint:gosec // custom chain verification below
+			VerifyPeerCertificate: verifyVeluxCertificate,
+			MinVersion:            tls.VersionTLS12,
+			MaxVersion:            tls.VersionTLS12,
+		}
 	}
 
 	// Create dialer with timeout
@@ -233,8 +250,9 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	// Start reader goroutine. Pass the connection explicitly so the loop reads
 	// from a local reference instead of racing with Disconnect setting c.conn = nil.
-	c.wg.Add(1)
-	go c.readLoop(conn)
+	done := make(chan struct{})
+	c.readDone = done
+	go c.readLoop(conn, done)
 
 	c.logger.Info().Msg("Connected to KLF-200")
 
@@ -763,8 +781,8 @@ func (c *Client) isAsyncNotification(cmd CommandID) bool {
 // It uses the connection passed at startup rather than c.conn so it does not
 // race with Disconnect, which sets c.conn = nil. The loop ends when the
 // connection is closed (by the peer or by Disconnect).
-func (c *Client) readLoop(conn *tls.Conn) {
-	defer c.wg.Done()
+func (c *Client) readLoop(conn *tls.Conn, done chan struct{}) {
+	defer close(done)
 
 	buf := make([]byte, 1024)
 	frameBuf := make([]byte, 0, 256)
@@ -857,19 +875,23 @@ func (c *Client) handleReadError(conn *tls.Conn, err error) {
 func (c *Client) Disconnect() error {
 	c.connMu.Lock()
 	conn := c.conn
+	done := c.readDone
 	c.conn = nil
+	c.readDone = nil
 	c.connected.Store(false)
 	c.authenticated.Store(false)
 	c.connMu.Unlock()
 
-	var err error
-	if conn != nil {
-		err = conn.Close()
+	if conn == nil {
+		return nil
 	}
+	err := conn.Close()
 
-	// Wait for the read loop outside the lock (it needs connMu to notice
-	// that it has been superseded).
-	c.wg.Wait()
+	// Wait for this connection's read loop outside the lock (it needs connMu
+	// to notice that it has been superseded).
+	if done != nil {
+		<-done
+	}
 	return err
 }
 

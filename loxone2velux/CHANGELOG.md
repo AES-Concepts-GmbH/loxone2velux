@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1
+
+- Fix: Data-Race im KLF-200-Client zwischen Keep-alive und Reconnect (WaitGroup wurde gleichzeitig gewartet und erhöht), gefunden durch den Race-Detector mit den neuen Integrationstests
+- Intern: simulierter KLF-200-Server (`internal/klf200/klf200test`) für Integrationstests von Client, Gateway und API
+- Intern: ConfigManager in eigenes Paket `internal/configmgr` verschoben und getestet
+- Intern: Frontend-Tests mit Vitest (API-Schicht, Token-Eingabe, Dashboard, NodeCard)
+- Intern: Go-Testabdeckung von 41 % auf 86 % erhöht, CI erzwingt mindestens 70 %; Frontend-Abdeckung 95 %
+
 ## 1.3.0
 
 Korrekturen aus dem Code-Review:

@@ -70,9 +70,17 @@ or `?token=<token>`. Position semantics: 0 = open, 100 = closed.
 ## Development
 
 ```bash
-go build ./... && go test ./...        # backend
-cd web && npm ci && npm run build      # frontend (output in web/dist, served by the gateway)
+go build ./... && go test -race ./...  # backend (unit + integration tests against a simulated KLF-200)
+cd web && npm ci && npm test           # frontend tests (Vitest)
+npm run build                          # frontend build (output in web/dist, served by the gateway)
 ```
+
+Coverage: `go test -coverprofile=c.out -coverpkg=./... ./... && go tool cover -func=c.out | tail -1`
+(CI requires at least 70 %) and `npm run test:coverage` in `web/`.
+
+The package `internal/klf200/klf200test` contains a simulated KLF-200 gateway
+(TLS + SLIP protocol) that the integration tests of the client, the gateway
+service and the HTTP API run against.
 
 The Go binary serves `./web/dist` when present. For frontend development run
 `npm run dev` in `web/`; the Vite dev server proxies `/api` and `/health` to
