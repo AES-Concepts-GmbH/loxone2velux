@@ -416,23 +416,25 @@ func (h *Handlers) configResponse(cfg *config.Config) ConfigResponse {
 	}
 }
 
+// RequireConfigManager answers 503 for routes that need the configuration
+// manager when none is available.
+func (h *Handlers) RequireConfigManager(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.configMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "Configuration manager not available", "")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // GetConfig returns the current configuration (without secrets)
 func (h *Handlers) GetConfig(w http.ResponseWriter, r *http.Request) {
-	if h.configMgr == nil {
-		writeError(w, http.StatusServiceUnavailable, "Configuration manager not available", "")
-		return
-	}
-
 	writeJSON(w, http.StatusOK, h.configResponse(h.configMgr.GetConfig()))
 }
 
 // UpdateConfig updates the configuration
 func (h *Handlers) UpdateConfig(w http.ResponseWriter, r *http.Request) {
-	if h.configMgr == nil {
-		writeError(w, http.StatusServiceUnavailable, "Configuration manager not available", "")
-		return
-	}
-
 	var req ConfigUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", err.Error())

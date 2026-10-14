@@ -1,5 +1,5 @@
 # Global build args (must be before first FROM)
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.22
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=
 
@@ -13,12 +13,12 @@ ARG BUILD_VERSION=
 # exist the SOURCE_BRANCH is used, so an add-on build always matches
 # a released version when one is tagged.
 # ============================================================
-FROM alpine:3.19 AS source
+FROM alpine:3.22 AS source
 
 RUN apk add --no-cache git
 
 # Use custom arg names to avoid HA Supervisor overriding them
-ARG SOURCE_REPO=https://github.com/stefanbeyeler/loxone2velux.git
+ARG SOURCE_REPO=https://github.com/AES-Concepts-GmbH/loxone2velux.git
 ARG SOURCE_BRANCH=main
 ARG BUILD_VERSION
 
@@ -40,7 +40,7 @@ RUN set -eu; \
 # ============================================================
 # Stage 2: Build frontend
 # ============================================================
-FROM node:20-alpine AS frontend
+FROM node:24-alpine AS frontend
 
 WORKDIR /web
 COPY --from=source /src/web/package.json /src/web/package-lock.json ./
@@ -52,7 +52,7 @@ RUN VITE_APP_VERSION=$(cat /tmp/VERSION) npm run build
 # ============================================================
 # Stage 3: Build Go binary
 # ============================================================
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 

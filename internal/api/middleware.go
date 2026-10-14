@@ -43,6 +43,24 @@ func NewLoggingMiddleware(logger zerolog.Logger) func(http.Handler) http.Handler
 	}
 }
 
+// maxRequestBodyBytes caps request bodies. All JSON payloads of this API are
+// a few hundred bytes; the limit only guards against oversized uploads.
+const maxRequestBodyBytes = 1 << 20
+
+// NewBodyLimitMiddleware rejects request bodies larger than limit bytes. The
+// limit is enforced while the body is read, so handlers see a read error and
+// answer 400 instead of buffering an unbounded payload.
+func NewBodyLimitMiddleware(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, limit)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // NewTokenAuthMiddleware creates a middleware that validates API tokens.
 // The token is read through tokenFn on every request so that a token changed
 // at runtime takes effect immediately. An empty token disables authentication.
