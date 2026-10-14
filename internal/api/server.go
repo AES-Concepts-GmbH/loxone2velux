@@ -104,6 +104,7 @@ func (s *Server) setupRoutes() *chi.Mux {
 	})
 	r.Use(NewLoggingMiddleware(s.logger))
 	r.Use(chimiddleware.Recoverer)
+	r.Use(NewBodyLimitMiddleware(maxRequestBodyBytes))
 	// The request context deadline must not exceed the server's write timeout,
 	// otherwise the connection is cut before the handler can answer.
 	requestTimeout := s.cfg.WriteTimeout
@@ -139,23 +140,27 @@ func (s *Server) setupRoutes() *chi.Mux {
 			r.Get("/", h.GetSensorStatus)
 			r.Post("/refresh", h.RefreshSensorStatus)
 		})
-		// Mapping endpoints
-		r.Route("/mappings", func(r chi.Router) {
-			r.Get("/", h.ListMappings)
-			r.Post("/", h.CreateMapping)
-			r.Put("/{mappingID}", h.UpdateMapping)
-			r.Delete("/{mappingID}", h.DeleteMapping)
-		})
-		// Loxone integration config
-		r.Route("/loxone", func(r chi.Router) {
-			r.Get("/config", h.GetLoxoneConfig)
-			r.Put("/config/udp", h.UpdateLoxoneUDPConfig)
-			r.Post("/config/udp/test", h.TestUDP)
-		})
-		// Configuration endpoints
-		r.Get("/config", h.GetConfig)
-		r.Post("/config", h.UpdateConfig)
 		r.Post("/reconnect", h.Reconnect)
+		// Endpoints that read or persist configuration
+		r.Group(func(r chi.Router) {
+			r.Use(h.RequireConfigManager)
+			// Mapping endpoints
+			r.Route("/mappings", func(r chi.Router) {
+				r.Get("/", h.ListMappings)
+				r.Post("/", h.CreateMapping)
+				r.Put("/{mappingID}", h.UpdateMapping)
+				r.Delete("/{mappingID}", h.DeleteMapping)
+			})
+			// Loxone integration config
+			r.Route("/loxone", func(r chi.Router) {
+				r.Get("/config", h.GetLoxoneConfig)
+				r.Put("/config/udp", h.UpdateLoxoneUDPConfig)
+				r.Post("/config/udp/test", h.TestUDP)
+			})
+			// Configuration endpoints
+			r.Get("/config", h.GetConfig)
+			r.Post("/config", h.UpdateConfig)
+		})
 	})
 
 	// Loxone-friendly endpoints - protected only if token is configured

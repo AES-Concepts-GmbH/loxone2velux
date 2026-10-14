@@ -263,3 +263,43 @@ func TestIngressBasePathIsEscaped(t *testing.T) {
 		t.Errorf("base tag missing or wrong: %s", body)
 	}
 }
+
+func TestRequestBodyLimit(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+
+	// A body above the limit is rejected before it is fully buffered.
+	huge := `{"name":"` + strings.Repeat("a", maxRequestBodyBytes+1) + `","loxone_id":"x"}`
+	if resp, _ := do(t, "POST", ts.URL+"/api/mappings", huge, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversized body status = %d, want 400", resp.StatusCode)
+	}
+
+	// A normal body still works.
+	if resp, _ := do(t, "POST", ts.URL+"/api/mappings", `{"name":"n","loxone_id":"x"}`, nil); resp.StatusCode != http.StatusCreated {
+		t.Errorf("normal body status = %d, want 201", resp.StatusCode)
+	}
+}
+
+func TestConfigRoutesWithoutConfigManager(t *testing.T) {
+	cfg := config.DefaultConfig()
+	gw := gateway.NewService(&cfg.KLF200, &cfg.Loxone, zerolog.Nop())
+	srv := NewServer(&cfg.Server, gw, zerolog.Nop(), nil, "test")
+	ts := httptest.NewServer(srv.setupRoutes())
+	t.Cleanup(ts.Close)
+
+	for _, tc := range []struct{ method, path string }{
+		{"GET", "/api/config"},
+		{"POST", "/api/config"},
+		{"GET", "/api/mappings"},
+		{"POST", "/api/mappings"},
+		{"GET", "/api/loxone/config"},
+	} {
+		if resp, _ := do(t, tc.method, ts.URL+tc.path, "{}", nil); resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s %s status = %d, want 503", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+
+	// Routes that do not need the config manager keep working.
+	if resp, _ := do(t, "GET", ts.URL+"/health", "", nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("health status = %d", resp.StatusCode)
+	}
+}

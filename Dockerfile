@@ -1,5 +1,5 @@
 # Frontend build stage
-FROM node:20-alpine AS frontend
+FROM node:24-alpine AS frontend
 
 WORKDIR /web
 
@@ -12,7 +12,7 @@ COPY web/ .
 RUN npm run build
 
 # Backend build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -31,7 +31,7 @@ RUN VERSION=$(cat VERSION 2>/dev/null || echo "dev") && \
     CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s -X main.version=${VERSION}" -o /loxone2velux ./cmd/gateway/
 
 # Runtime stage
-FROM alpine:3.19
+FROM alpine:3.22
 
 WORKDIR /app
 

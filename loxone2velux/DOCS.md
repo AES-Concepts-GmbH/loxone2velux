@@ -34,10 +34,10 @@ Home Assistant. Mappings und UDP-Feedback werden über die REST API verwaltet
 ### Weitere Einstellungen
 
 - **log_level** (Standard: info): Log-Level (debug, info, warn, error)
-- **api_token** (empfohlen): API-Token für Authentifizierung, mindestens
-  16 Zeichen. Leer lassen um Authentifizierung zu deaktivieren. **Ohne Token
-  kann jedes Gerät im Netzwerk die Fenster über Port 8099 steuern.**
-  Token erzeugen z. B. mit `openssl rand -hex 32`.
+- **api_token** (erforderlich): API-Token für Authentifizierung, mindestens
+  16 Zeichen. Ohne Token könnte jedes Gerät im Netzwerk die Fenster über
+  Port 8099 steuern und die KLF-200-Zugangsdaten ändern, deshalb startet das
+  Add-on nicht mit leerem Token. Token erzeugen z. B. mit `openssl rand -hex 32`.
 
 ## Web-Interface
 
@@ -46,8 +46,8 @@ Das Dashboard zeigt alle verbundenen Velux Geräte mit Echtzeit-Positionsanzeige
 Geräte können geöffnet, geschlossen, gestoppt oder auf eine bestimmte Position
 gefahren werden.
 
-Ist ein `api_token` gesetzt, fragt das Dashboard beim ersten Aufruf nach dem
-Token und speichert ihn im Browser.
+Das Dashboard fragt beim ersten Aufruf nach dem `api_token` und speichert ihn
+im Browser.
 
 ## Loxone Integration
 
@@ -78,7 +78,7 @@ Position 0 = offen, 100 = geschlossen.
 
 Ersetze `{id}` mit der Velux Node-ID (siehe Dashboard) und `{pct}` mit 0-100.
 
-Falls ein API-Token gesetzt ist, `?token=DEIN_TOKEN` an die URL anhängen
+Den `api_token` als `?token=DEIN_TOKEN` an die URL anhängen
 (oder Header `Authorization: Bearer DEIN_TOKEN`).
 
 ### UDP-Feedback (Push an den Miniserver)
@@ -93,7 +93,7 @@ virtuellen UDP-Eingang des Miniservers senden. Format pro Paket:
 Eigenschaften: `position` (0–100), `target` (0–100), `state` (KLF-200
 Node-State), `rain` (0/1), `wind` (0/1).
 
-UDP-Feedback aktivieren (Beispiel mit `curl`, `-H` weglassen ohne Token):
+UDP-Feedback aktivieren (Beispiel mit `curl`):
 
 ```
 curl -X PUT http://<HA_IP>:8099/api/loxone/config/udp \
@@ -137,4 +137,4 @@ Port 8099 wird für den direkten Loxone-Zugriff auf dem Host exponiert.
 ## Support
 
 Issues und Feature-Requests:
-https://github.com/stefanbeyeler/loxone2velux/issues
+https://github.com/AES-Concepts-GmbH/loxone2velux/issues

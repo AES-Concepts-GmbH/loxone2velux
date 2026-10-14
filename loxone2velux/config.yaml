@@ -1,10 +1,10 @@
 name: Loxone2Velux Gateway
-version: "1.3.1"
+version: "1.3.2"
 slug: loxone2velux
 description: >-
   Bridge between Loxone home automation and Velux KLF-200 gateway for
   controlling windows, shutters, and blinds via REST API and web UI.
-url: "https://github.com/stefanbeyeler/loxone2velux"
+url: "https://github.com/AES-Concepts-GmbH/loxone2velux"
 
 arch:
   - amd64
@@ -60,4 +60,4 @@ schema:
   reconnect_interval: "int(5,3600)"
   refresh_interval: "int(30,86400)"
   log_level: list(debug|info|warn|error)
-  api_token: "match(^(.{16,})?$)?"
+  api_token: "match(^.{16,}$)"

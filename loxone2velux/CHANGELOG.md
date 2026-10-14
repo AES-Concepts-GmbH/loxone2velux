@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.2
+
+Umsetzung der Punkte aus dem Repository-Review:
+
+- **Achtung (Breaking):** `api_token` ist jetzt Pflicht und muss mindestens 16 Zeichen lang sein. Ohne Token liess sich die API im Netzwerk unauthentifiziert bedienen, inklusive Ändern von KLF-200-Host und -Passwort. Bestehende Installationen mit leerem Token müssen vor dem Update einen Token setzen (z. B. `openssl rand -hex 32`)
+- Sicherheit: Request-Bodys sind auf 1 MiB begrenzt
+- Fix: Konfigurations-Endpunkte (`/api/config`, `/api/mappings`, `/api/loxone/config`) antworten mit 503 statt abzustürzen, wenn kein Config-Manager verfügbar ist
+- Build: Go 1.26, Node 24, Alpine 3.22 (HA-Basisimage 3.22); Go-Abhängigkeiten aktualisiert
+- Build: Repository-URLs zeigen auf `AES-Concepts-GmbH/loxone2velux`; Frontend-Version synchron zu `VERSION`
+
 ## 1.3.1
 
 - Fix: Data-Race im KLF-200-Client zwischen Keep-alive und Reconnect (WaitGroup wurde gleichzeitig gewartet und erhöht), gefunden durch den Race-Detector mit den neuen Integrationstests
