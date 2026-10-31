@@ -516,6 +516,13 @@ func (c *Client) Stop(ctx context.Context, nodeID uint8) error {
 	return c.sendMainParameter(ctx, nodeID, PositionCurrent)
 }
 
+// limitationFrameTimeout bounds the wait for each individual frame of a
+// limitation status exchange. The KLF-200 queries every actuator over the
+// radio before it answers, so a chunk of 20 nodes can legitimately take far
+// longer than a single frame; the overall exchange is bounded by ctx.
+// (Variable so tests can shorten it.)
+var limitationFrameTimeout = 5 * time.Second
+
 // GetLimitationStatus requests the limitation status for the given nodes and
 // processes the resulting GW_LIMITATION_STATUS_NTF notifications (which
 // update the sensor status). Nodes are queried in chunks of 20.
@@ -579,12 +586,12 @@ func (c *Client) getLimitationStatusChunk(ctx context.Context, nodeIDs []uint8) 
 	if err := c.sendRaw(ctx, frame); err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	accepted := false
 	received := make(map[uint8]*LimitationStatus)
 	for !accepted || len(pending) != 0 {
-		resp, err := c.waitForResponse(ctx, 0, 5*time.Second)
+		// Wait per frame, not per chunk: each notification resets the budget,
+		// while a silent gateway or a missing node still fails the refresh.
+		resp, err := c.waitForResponse(ctx, 0, limitationFrameTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("incomplete limitation status (%d nodes missing): %w", len(pending), err)
 		}
