@@ -51,12 +51,13 @@ type Client struct {
 	// responseChan (Authenticate, GetAllNodes, SetPosition, Stop, GetState,
 	// GetLimitationStatus) so concurrent callers cannot steal each other's
 	// confirmation frames. This is a coarse lock, not per-session demux.
-	exchangeMu sync.Mutex
+	exchangeMu exchangeGate
 
 	// Sensor status, derived from the per-node limitation originators.
 	sensorStatus    SensorStatus
 	nodeLimitations map[uint8]LimitationOriginator
 	sensorStatusMu  sync.RWMutex
+	sensorRefreshMu exchangeGate
 }
 
 // ClientConfig holds configuration for the KLF-200 client
@@ -95,9 +96,6 @@ func (c *Client) UpdateConfig(cfg ClientConfig) {
 	c.password = cfg.Password
 	if cfg.TLSConfig != nil {
 		c.tlsCfg = cfg.TLSConfig
-	}
-	if cfg.Logger.GetLevel() != zerolog.Disabled {
-		c.logger = cfg.Logger
 	}
 }
 
@@ -245,6 +243,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	// an exchange on the new one.
 	c.drainResponses()
 
+	c.sensorStatusMu.Lock()
+	c.sensorStatus.Valid = false
+	c.sensorStatusMu.Unlock()
 	c.conn = conn
 	c.connected.Store(true)
 
@@ -276,15 +277,20 @@ func (c *Client) Authenticate(ctx context.Context) error {
 		return fmt.Errorf("not connected")
 	}
 
-	c.exchangeMu.Lock()
-	defer c.exchangeMu.Unlock()
+	if err := c.exchangeMu.acquire(ctx, false); err != nil {
+		return err
+	}
+	defer c.exchangeMu.release()
 
 	c.logger.Debug().Msg("Authenticating with KLF-200")
 
 	// Send password. Note: the frame embeds the password bytes, so it must
 	// never be logged in cleartext.
-	frame := BuildPasswordEnterRequest(c.password)
-	if err := c.sendRaw(frame); err != nil {
+	c.connMu.Lock()
+	password := c.password
+	c.connMu.Unlock()
+	frame := BuildPasswordEnterRequest(password)
+	if err := c.sendRaw(ctx, frame); err != nil {
 		return fmt.Errorf("failed to send password: %w", err)
 	}
 
@@ -317,7 +323,7 @@ func (c *Client) Authenticate(ctx context.Context) error {
 // enableHouseStatusMonitor enables notifications for position changes
 func (c *Client) enableHouseStatusMonitor(ctx context.Context) error {
 	frame := BuildHouseStatusMonitorEnableRequest()
-	if err := c.sendRaw(frame); err != nil {
+	if err := c.sendRaw(ctx, frame); err != nil {
 		return err
 	}
 
@@ -333,10 +339,12 @@ func (c *Client) GetState(ctx context.Context) error {
 		return fmt.Errorf("not authenticated")
 	}
 
-	c.exchangeMu.Lock()
-	defer c.exchangeMu.Unlock()
+	if err := c.exchangeMu.acquire(ctx, false); err != nil {
+		return err
+	}
+	defer c.exchangeMu.release()
 
-	if err := c.sendRaw(BuildGetStateRequest()); err != nil {
+	if err := c.sendRaw(ctx, BuildGetStateRequest()); err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
@@ -354,13 +362,15 @@ func (c *Client) GetAllNodes(ctx context.Context) ([]*Node, error) {
 		return nil, fmt.Errorf("not authenticated")
 	}
 
-	c.exchangeMu.Lock()
-	defer c.exchangeMu.Unlock()
+	if err := c.exchangeMu.acquire(ctx, false); err != nil {
+		return nil, err
+	}
+	defer c.exchangeMu.release()
 
 	c.logger.Debug().Msg("Getting all nodes")
 
 	frame := BuildGetAllNodesRequest()
-	if err := c.sendRaw(frame); err != nil {
+	if err := c.sendRaw(ctx, frame); err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
@@ -412,8 +422,10 @@ func (c *Client) sendMainParameter(ctx context.Context, nodeID uint8, mainParame
 		return fmt.Errorf("not authenticated")
 	}
 
-	c.exchangeMu.Lock()
-	defer c.exchangeMu.Unlock()
+	if err := c.exchangeMu.acquire(ctx, mainParameter == PositionCurrent); err != nil {
+		return err
+	}
+	defer c.exchangeMu.release()
 
 	sessionID := uint16(c.sessionID.Add(1))
 
@@ -432,7 +444,7 @@ func (c *Client) sendMainParameter(ctx context.Context, nodeID uint8, mainParame
 		nil,
 	)
 
-	if err := c.sendRaw(frame); err != nil {
+	if err := c.sendRaw(ctx, frame); err != nil {
 		return fmt.Errorf("failed to send command: %w", err)
 	}
 
@@ -511,64 +523,98 @@ func (c *Client) GetLimitationStatus(ctx context.Context, nodeIDs []uint8) error
 	if !c.authenticated.Load() {
 		return fmt.Errorf("not authenticated")
 	}
-
+	if err := c.sensorRefreshMu.acquire(ctx, false); err != nil {
+		return err
+	}
+	defer c.sensorRefreshMu.release()
+	// Collect all chunks before publishing a complete, fresh aggregate.
+	statuses := make(map[uint8]*LimitationStatus)
 	for start := 0; start < len(nodeIDs); start += MaxNodesPerRequest {
 		end := start + MaxNodesPerRequest
 		if end > len(nodeIDs) {
 			end = len(nodeIDs)
 		}
-		if err := c.getLimitationStatusChunk(ctx, nodeIDs[start:end]); err != nil {
+		chunk, err := c.getLimitationStatusChunk(ctx, nodeIDs[start:end])
+		if err != nil {
 			return err
 		}
+		for id, status := range chunk {
+			statuses[id] = status
+		}
+	}
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	c.sensorStatusMu.Lock()
+	c.nodeLimitations = make(map[uint8]LimitationOriginator)
+	rain, wind := false, false
+	for id, status := range statuses {
+		if !status.Active() {
+			continue
+		}
+		c.nodeLimitations[id] = status.LimitationOrigin
+		rain = rain || status.LimitationOrigin == LimitationOriginatorRain
+		wind = wind || status.LimitationOrigin == LimitationOriginatorWind
+	}
+	c.sensorStatus = SensorStatus{RainDetected: rain, WindDetected: wind, Valid: true, LastUpdate: time.Now()}
+	snapshot := c.sensorStatus
+	c.sensorStatusMu.Unlock()
+	if c.onSensorUpdate != nil {
+		c.onSensorUpdate(snapshot)
 	}
 	return nil
 }
 
-func (c *Client) getLimitationStatusChunk(ctx context.Context, nodeIDs []uint8) error {
-	c.exchangeMu.Lock()
-	defer c.exchangeMu.Unlock()
-
+func (c *Client) getLimitationStatusChunk(ctx context.Context, nodeIDs []uint8) (map[uint8]*LimitationStatus, error) {
+	if err := c.exchangeMu.acquire(ctx, false); err != nil {
+		return nil, err
+	}
+	defer c.exchangeMu.release()
 	sessionID := uint16(c.sessionID.Add(1))
-
-	c.logger.Debug().Interface("nodes", nodeIDs).Uint16("sessionID", sessionID).Msg("Getting limitation status")
-
-	frame := BuildGetLimitationStatusRequest(sessionID, nodeIDs, 0) // 0 = min limitation
-	if err := c.sendRaw(frame); err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
+	pending := make(map[uint8]bool, len(nodeIDs))
+	for _, id := range nodeIDs {
+		pending[id] = true
 	}
-
-	// Wait for confirmation
-	cfm, err := c.waitForResponse(ctx, GW_GET_LIMITATION_STATUS_CFM, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("failed to get confirmation: %w", err)
+	frame := BuildGetLimitationStatusRequest(sessionID, nodeIDs, 0)
+	if err := c.sendRaw(ctx, frame); err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
-	// Status: 0 = rejected, 1 = accepted
-	if len(cfm.Data) >= 3 && cfm.Data[2] != 1 {
-		return fmt.Errorf("limitation status request rejected by KLF-200")
-	}
-
-	// Consume one GW_LIMITATION_STATUS_NTF per requested node. Each one is
-	// dispatched through handleAsyncFrame, which updates the sensor status.
-	// (GW_SESSION_FINISHED_NTF is handled asynchronously and not relied upon.)
-	received := 0
-	for {
-		resp, err := c.waitForResponse(ctx, 0, 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	accepted := false
+	received := make(map[uint8]*LimitationStatus)
+	for !accepted || len(pending) != 0 {
+		resp, err := c.waitForResponse(ctx, 0, 5*time.Second)
 		if err != nil {
-			if received > 0 {
-				// Some gateways do not send GW_SESSION_FINISHED_NTF for this request.
-				return nil
+			return nil, fmt.Errorf("incomplete limitation status (%d nodes missing): %w", len(pending), err)
+		}
+		switch resp.Command {
+		case GW_GET_LIMITATION_STATUS_CFM:
+			if len(resp.Data) < 3 {
+				return nil, fmt.Errorf("malformed limitation confirmation")
 			}
-			return fmt.Errorf("no limitation status received: %w", err)
-		}
-
-		if resp.Command == GW_LIMITATION_STATUS_NTF {
-			received++
-		}
-		c.handleAsyncFrame(resp)
-		if received >= len(nodeIDs) {
-			return nil
+			if uint16(resp.Data[0])<<8|uint16(resp.Data[1]) != sessionID {
+				continue
+			}
+			if resp.Data[2] != 1 {
+				return nil, fmt.Errorf("limitation status request rejected by KLF-200")
+			}
+			accepted = true
+		case GW_LIMITATION_STATUS_NTF:
+			status, err := ParseLimitationStatusNotification(resp.Data)
+			if err != nil {
+				return nil, err
+			}
+			if status.SessionID != sessionID || !pending[status.NodeID] {
+				continue
+			}
+			received[status.NodeID] = status
+			delete(pending, status.NodeID)
+		default:
+			c.handleAsyncFrame(resp)
 		}
 	}
+	return received, nil
 }
 
 // setNodeLimitation records the limitation originator for a node (or clears
@@ -597,7 +643,6 @@ func (c *Client) setNodeLimitation(nodeID uint8, origin LimitationOriginator) {
 	}
 	c.sensorStatus.RainDetected = rain
 	c.sensorStatus.WindDetected = wind
-	c.sensorStatus.LastUpdate = time.Now()
 
 	changed := oldRain != rain || oldWind != wind
 	statusCopy := c.sensorStatus
@@ -630,17 +675,17 @@ func (c *Client) RefreshSensorStatus(ctx context.Context, nodeIDs []uint8) error
 		return nil
 	}
 	if err := c.GetLimitationStatus(ctx, nodeIDs); err != nil {
+		c.sensorStatusMu.Lock()
+		c.sensorStatus.Valid = false
+		c.sensorStatusMu.Unlock()
 		c.logger.Warn().Err(err).Msg("Sensor status refresh failed, keeping previous values")
 		return err
 	}
-	c.sensorStatusMu.Lock()
-	c.sensorStatus.LastUpdate = time.Now()
-	c.sensorStatusMu.Unlock()
 	return nil
 }
 
 // sendRaw sends raw bytes to the KLF-200
-func (c *Client) sendRaw(data []byte) error {
+func (c *Client) sendRaw(ctx context.Context, data []byte) error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
@@ -648,8 +693,27 @@ func (c *Client) sendRaw(data []byte) error {
 		return fmt.Errorf("not connected")
 	}
 
-	c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err := c.conn.Write(data)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	if at, ok := ctx.Deadline(); ok && at.Before(deadline) {
+		deadline = at
+	}
+	conn := c.conn
+	conn.SetWriteDeadline(deadline)
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { conn.SetWriteDeadline(time.Now()); close(done) })
+	n, err := conn.Write(data)
+	if !stop() {
+		<-done
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -843,6 +907,14 @@ func (c *Client) readLoop(conn *tls.Conn, done chan struct{}) {
 				}
 				inFrame = true
 			} else if inFrame {
+				// One-byte length permits at most 257 decoded bytes,
+				// each of which can expand to two SLIP bytes.
+				if len(frameBuf) >= 2*257 {
+					frameBuf = frameBuf[:0]
+					inFrame = false
+					c.logger.Warn().Msg("Discarding oversized SLIP frame")
+					continue
+				}
 				frameBuf = append(frameBuf, b)
 			}
 		}

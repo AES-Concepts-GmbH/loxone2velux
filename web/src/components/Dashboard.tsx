@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { NodeList } from './NodeList';
 import { LoxoneGuide } from './LoxoneGuide';
 import { SensorCard } from './SensorCard';
@@ -21,9 +21,12 @@ import {
 type Tab = 'devices' | 'guide';
 
 export function Dashboard() {
+  const latestPoll = useRef(0);
+  const pollInFlight = useRef(false);
   const [activeTab, setActiveTab] = useState<Tab>('devices');
   const [menuOpen, setMenuOpen] = useState(false);
   const [nodes, setNodes] = useState<Node[]>([]);
+  const [targets, setTargets] = useState<Record<number, number>>({});
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [sensors, setSensors] = useState<SensorStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -44,6 +47,9 @@ export function Dashboard() {
   }, []);
 
   const fetchData = useCallback(async () => {
+    if (pollInFlight.current) return;
+    pollInFlight.current = true;
+    const poll = ++latestPoll.current;
     setLoading(true);
     setError(null);
 
@@ -57,14 +63,24 @@ export function Dashboard() {
         }),
       ]);
 
+      if (poll !== latestPoll.current) return;
       setHealth(healthData);
       setNodes(nodesData.nodes || []);
-      if (sensorData) setSensors(sensorData);
+      setSensors(sensorData);
+      setTargets(current => Object.fromEntries(Object.entries(current).filter(([id, target]) => {
+        const node = nodesData.nodes.find(n => n.id === Number(id));
+        return node && !node.stale && node.state_str !== "Error" && Math.abs(node.position_percent - target) > 1;
+      })));
       setAuthRequired(false);
     } catch (err) {
+      if (poll !== latestPoll.current) return;
+      setHealth(null);
+      setSensors(null);
+      setNodes(current => current.map(node => ({ ...node, stale: true })));
       handleError(err, 'Fehler beim Laden');
     } finally {
-      setLoading(false);
+      pollInFlight.current = false;
+      if (poll === latestPoll.current) setLoading(false);
     }
   }, [handleError]);
 
@@ -86,6 +102,7 @@ export function Dashboard() {
       const sensorData = await api.refreshSensorStatus();
       setSensors(sensorData);
     } catch (err) {
+      setSensors(current => current ? { ...current, valid: false } : null);
       handleError(err, 'Sensor-Abfrage fehlgeschlagen');
     } finally {
       setSensorsRefreshing(false);
@@ -115,11 +132,9 @@ export function Dashboard() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // Optimistic position update (functional update so concurrent polls are not overwritten)
+  // Acknowledged targets are separate from measured positions.
   const applyPosition = (id: number, position: number) => {
-    setNodes((current) =>
-      current.map((n) => (n.id === id ? { ...n, position_percent: position } : n))
-    );
+    setTargets(current => ({ ...current, [id]: position }));
   };
 
   const handleSetPosition = async (id: number, position: number) => {
@@ -152,6 +167,11 @@ export function Dashboard() {
   const handleStop = async (id: number) => {
     try {
       await api.stopNode(id);
+      setTargets(current => {
+        const remaining = { ...current };
+        delete remaining[id];
+        return remaining;
+      });
     } catch (err) {
       handleError(err, 'Fehler');
     }
@@ -195,7 +215,7 @@ export function Dashboard() {
                   <WifiOff size={18} className="text-red-500" />
                 )}
                 <span className="text-sm text-gray-400">
-                  {isConnected ? 'Verbunden' : 'Getrennt'}
+                  {health === null ? 'Status unbekannt' : isConnected ? 'Verbunden' : 'Getrennt'}
                 </span>
               </div>
 
@@ -349,6 +369,7 @@ export function Dashboard() {
             {/* Node List */}
             <NodeList
               nodes={nodes}
+              targets={targets}
               loading={loading}
               onSetPosition={handleSetPosition}
               onOpen={handleOpen}

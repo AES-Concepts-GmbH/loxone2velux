@@ -1,5 +1,5 @@
 # Frontend build stage
-FROM node:24-alpine AS frontend
+FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend
 
 WORKDIR /web
 
@@ -9,10 +9,11 @@ RUN npm ci --no-audit --no-fund
 
 # Copy source and build
 COPY web/ .
+COPY VERSION /VERSION
 RUN npm run build
 
 # Backend build stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 
 WORKDIR /app
 
@@ -49,8 +50,9 @@ COPY --from=frontend /web/dist /app/web/dist
 COPY config.example.yaml /app/config.example.yaml
 
 # Create non-root user
-RUN adduser -D -u 1000 appuser
+RUN adduser -D -u 1000 appuser && mkdir -p /data && chown appuser:appuser /data
 USER appuser
+VOLUME ["/data"]
 
 # Expose HTTP port
 EXPOSE 8080
@@ -61,4 +63,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Run the application
 ENTRYPOINT ["/app/loxone2velux"]
-CMD ["-config", "/app/config.yaml"]
+CMD ["-config", "/data/config.yaml"]

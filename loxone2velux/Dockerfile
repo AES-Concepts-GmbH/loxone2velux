@@ -40,7 +40,9 @@ RUN set -eu; \
 # ============================================================
 # Stage 2: Build frontend
 # ============================================================
-FROM node:24-alpine AS frontend
+# The dashboard is architecture independent. Build on the native builder so
+# Rolldown does not need an ARMv7 musl binary on 32-bit add-on targets.
+FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend
 
 WORKDIR /web
 COPY --from=source /src/web/package.json /src/web/package-lock.json ./
@@ -52,7 +54,7 @@ RUN VITE_APP_VERSION=$(cat /tmp/VERSION) npm run build
 # ============================================================
 # Stage 3: Build Go binary
 # ============================================================
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 
 WORKDIR /app
 

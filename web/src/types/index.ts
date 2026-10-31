@@ -33,6 +33,7 @@ export type NodeState =
 
 // Velux Node/Device
 export interface Node {
+  stale?: boolean;
   id: number;
   name: string;
   node_type: number;
@@ -94,6 +95,7 @@ export interface PositionRequest {
 
 // Sensor status
 export interface SensorStatus {
+  valid?: boolean;
   rain_detected: boolean;
   wind_detected: boolean;
   last_update: string;
@@ -116,6 +118,7 @@ export interface UDPFeedbackConfig {
 
 // Configuration as returned by GET /api/config (secrets are never returned)
 export interface GatewayConfig {
+  managed: boolean;
   klf200: {
     host: string;
     port: number;

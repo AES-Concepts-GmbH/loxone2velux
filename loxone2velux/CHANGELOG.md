@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Fix: Speicherfehler werden an die API zurückgegeben; Konfigurationen werden atomar mit `0600` ersetzt und erst danach im laufenden Betrieb übernommen
+- Fix: Parallele Konfigurations- und Mappingänderungen werden vollständig serialisiert
+- Fix: Abgelaufene Gerätebefehle verlassen die Warteschlange ohne Senden; wartende Stop-Befehle haben Vorrang
+- Fix: Sensor-Refresh prüft Session, Geräte und Vollständigkeit; unbekannte/veraltete Positionen und Sensorwerte werden gekennzeichnet
+- Dashboard: angenommene Ziele und gemessene Positionen getrennt, zeitlich begrenzte Abfragen, tastaturfähiger Positionsregler und konfigurierbare direkte Loxone-Adresse
+- Betrieb: periodischer UDP-Zustandsabgleich, begrenzter SLIP-Empfangspuffer und kontextgebundener Shutdown
+- **Umstellung:** Docker speichert unter `/data/config.yaml`; das gesamte Verzeichnis beschreibbar einbinden. Migration siehe README
+- **Umstellung:** HA-Optionen verwalten Zugangsdaten, API-Token und Log-Level verbindlich. Änderungen dieser Werte über die REST-API werden abgewiesen; Mappings/UDP bleiben editierbar
+- Build: Go 1.26.10 und aktualisierte Frontend-Werkzeuge; Abhängigkeitenaudits und Container-Persistenztest in CI
+
 ## 1.3.2
 
 Umsetzung der Punkte aus dem Repository-Review:

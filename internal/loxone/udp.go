@@ -26,35 +26,44 @@ func NewUDPSender(logger zerolog.Logger) *UDPSender {
 
 // Configure sets up or reconfigures the UDP sender based on current config.
 func (s *UDPSender) Configure(cfg config.UDPFeedbackConfig) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Close existing connection if any
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-
-	s.enabled = cfg.Enabled
-	if !cfg.Enabled || cfg.IP == "" || cfg.Port == 0 {
-		s.enabled = false
-		s.logger.Info().Msg("UDP feedback disabled")
-		return nil
-	}
-
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", cfg.IP, cfg.Port))
+	commit, abort, err := s.Prepare(cfg)
 	if err != nil {
-		return fmt.Errorf("invalid UDP address: %w", err)
+		return err
 	}
-
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return fmt.Errorf("failed to create UDP connection: %w", err)
-	}
-
-	s.conn = conn
-	s.logger.Info().Str("addr", addr.String()).Msg("UDP feedback configured")
+	defer abort()
+	commit()
 	return nil
+}
+
+// Prepare opens a replacement socket without changing the active sender.
+// Commit only after persistence succeeds; abort releases an unused socket.
+func (s *UDPSender) Prepare(cfg config.UDPFeedbackConfig) (commit func(), abort func(), err error) {
+	var conn *net.UDPConn
+	if cfg.Enabled && cfg.IP != "" && cfg.Port != 0 {
+		addr, resolveErr := net.ResolveUDPAddr("udp", net.JoinHostPort(cfg.IP, fmt.Sprint(cfg.Port)))
+		if resolveErr != nil {
+			return nil, nil, fmt.Errorf("invalid UDP address: %w", resolveErr)
+		}
+		conn, err = net.DialUDP("udp", nil, addr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create UDP connection: %w", err)
+		}
+	}
+	return func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.conn != nil {
+				s.conn.Close()
+			}
+			s.conn = conn
+			s.enabled = conn != nil
+			conn = nil // Ownership transferred to the sender.
+		}, func() {
+			if conn != nil {
+				conn.Close()
+				conn = nil
+			}
+		}, nil
 }
 
 // IsEnabled returns whether UDP feedback is currently enabled
@@ -66,13 +75,13 @@ func (s *UDPSender) IsEnabled() bool {
 
 // Send sends a single property update to the Loxone Miniserver.
 // Format: "<loxone_id>/<property>:<value>"
-// Fire-and-forget: errors are logged but not returned.
-func (s *UDPSender) Send(loxoneID, property string, value interface{}) {
+// Socket errors are logged and returned; UDP delivery remains unacknowledged.
+func (s *UDPSender) Send(loxoneID, property string, value interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if !s.enabled || s.conn == nil {
-		return
+		return fmt.Errorf("UDP feedback disabled")
 	}
 
 	msg := fmt.Sprintf("%s/%s:%v", loxoneID, property, value)
@@ -83,6 +92,7 @@ func (s *UDPSender) Send(loxoneID, property string, value interface{}) {
 	} else {
 		s.logger.Debug().Str("msg", msg).Msg("UDP feedback sent")
 	}
+	return err
 }
 
 // Close closes the UDP connection

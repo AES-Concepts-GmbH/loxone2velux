@@ -40,7 +40,7 @@ func TestGettersAndClone(t *testing.T) {
 }
 
 func TestUpdateConfigPersistsAndApplies(t *testing.T) {
-	m, cfgPath, loxPath := newManager(t, nil)
+	m, cfgPath, _ := newManager(t, nil)
 	var appliedLevel string
 	m.setLogLevel = func(l string) { appliedLevel = l }
 
@@ -65,9 +65,8 @@ func TestUpdateConfigPersistsAndApplies(t *testing.T) {
 	if saved.Server.APIToken != "0123456789abcdef" || saved.Logging.Level != "debug" {
 		t.Errorf("saved config = %+v", saved)
 	}
-	side, err := config.LoadLoxoneConfig(loxPath)
-	if err != nil || len(side.Mappings) != 1 || side.Mappings[0].ID != "m1" {
-		t.Errorf("sidecar = %+v err=%v", side, err)
+	if len(saved.Loxone.Mappings) != 1 || saved.Loxone.Mappings[0].ID != "m1" {
+		t.Fatal("mapping not persisted in canonical config")
 	}
 
 	// Same level again does not re-apply
@@ -101,16 +100,16 @@ func TestUpdateConfigValidationFailureLeavesStateUntouched(t *testing.T) {
 	}
 }
 
-func TestUpdateConfigSurvivesUnwritablePath(t *testing.T) {
+func TestUpdateConfigRejectsUnwritablePath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	m := New(cfg, filepath.Join(t.TempDir(), "missing-dir", "config.yaml"), "", nil, zerolog.Nop())
 	c := m.GetConfig()
 	c.Logging.Level = "warn"
-	if err := m.UpdateConfig(c); err != nil {
-		t.Fatalf("UpdateConfig should keep the in-memory config: %v", err)
+	if err := m.UpdateConfig(c); err == nil {
+		t.Fatal("expected persistence error")
 	}
-	if m.GetConfig().Logging.Level != "warn" {
-		t.Error("in-memory config not updated")
+	if m.GetConfig().Logging.Level != "info" {
+		t.Error("in-memory config changed after failed save")
 	}
 }
 

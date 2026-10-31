@@ -310,6 +310,7 @@ type Node struct {
 	Velocity        Velocity  `json:"velocity"`
 	LastUpdate      time.Time `json:"last_update"`
 	Inverted        bool      `json:"inverted"` // true for window openers (0%=closed, 100%=open)
+	Stale           bool      `json:"stale"`
 
 	// PositionValid indicates that CurrentPosition/TargetPosition carry real
 	// data. State-only updates (e.g. from GW_COMMAND_RUN_STATUS_NTF) leave it
@@ -329,7 +330,7 @@ func (t NodeType) IsInvertedType() bool {
 // 0 = fully open, 100 = fully closed
 func PositionToPercent(raw uint16) float64 {
 	if raw > PositionMax {
-		return 100.0
+		return -1 // Explicitly unknown; never report a confirmed closed position.
 	}
 	return float64(raw) / float64(PositionMax) * 100.0
 }
@@ -423,6 +424,7 @@ func (l *LimitationStatus) Active() bool {
 
 // SensorStatus represents the current sensor readings
 type SensorStatus struct {
+	Valid        bool      `json:"valid"`
 	RainDetected bool      `json:"rain_detected"`
 	WindDetected bool      `json:"wind_detected"`
 	LastUpdate   time.Time `json:"last_update"`

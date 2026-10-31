@@ -13,6 +13,7 @@
 
 # Go workspace file
 go.work
+go.work.sum
 
 # IDE
 .idea/
@@ -23,6 +24,12 @@ go.work
 # Config with secrets
 config.yaml
 !loxone2velux/config.yaml
+/loxone.yaml
+/loxone.yaml.legacy
+/data/
+.env
+.env.*
+!.env.example
 
 # Docker image export
 *.tar
@@ -30,6 +37,10 @@ config.yaml
 # Frontend build output and dependencies
 web/node_modules/
 web/dist/
+web/coverage/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
 
 # Claude Code
 .claude/

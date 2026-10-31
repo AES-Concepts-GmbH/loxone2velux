@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -176,6 +177,9 @@ func (c *Config) Validate() error {
 
 // Validate validates the Loxone integration settings.
 func (l *LoxoneConfig) Validate() error {
+	if len(l.Mappings) > 1000 {
+		return validationError("loxone.mappings must contain at most 1000 entries")
+	}
 	if l.UDPFeedback.Enabled {
 		if l.UDPFeedback.IP == "" {
 			return validationError("loxone.udp_feedback.ip is required when UDP feedback is enabled")
@@ -223,11 +227,25 @@ func (c *Config) IsKLF200Configured() bool {
 // writeFilePrivate writes data to path with owner-only permissions, since the
 // configuration files contain the KLF-200 password and the API token.
 func writeFilePrivate(path string, data []byte) error {
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".config-*")
+	if err != nil {
 		return err
 	}
-	// WriteFile only applies the mode to newly created files.
-	return os.Chmod(path, 0o600)
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // Save saves the configuration to a YAML file
@@ -290,5 +308,32 @@ func SaveLoxoneConfig(path string, lc *LoxoneConfig) error {
 		return fmt.Errorf("failed to write loxone config: %w", err)
 	}
 
+	return nil
+}
+
+// MigrateLoxoneSidecar consolidates legacy standalone settings exactly once.
+// Save the complete config first, then retain the sidecar as a backup. A failed
+// rename stops startup, so no API changes can race with an unfinished migration.
+func MigrateLoxoneSidecar(configPath, sidecarPath string, cfg *Config) error {
+	lc, err := LoadLoxoneConfig(sidecarPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load legacy sidecar: %w", err)
+	}
+	backup := sidecarPath + ".legacy"
+	if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("legacy backup already exists or is inaccessible: %s", backup)
+	}
+	merged := cfg.Clone()
+	merged.Loxone = *lc
+	if err := merged.Save(configPath); err != nil {
+		return fmt.Errorf("migrate legacy sidecar: %w", err)
+	}
+	if err := os.Rename(sidecarPath, backup); err != nil {
+		return fmt.Errorf("retain legacy sidecar backup: %w", err)
+	}
+	*cfg = *merged
 	return nil
 }

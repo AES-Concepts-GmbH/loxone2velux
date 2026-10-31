@@ -71,16 +71,19 @@ function Accordion({ title, children, defaultOpen = false }: AccordionProps) {
   );
 }
 
-const DIRECT_PORT = 8099;
-
 export function LoxoneGuide() {
   const token = getToken();
   const hasToken = token.length > 0;
   // Show token suffix only if auth is enabled
-  const tokenSuffix = hasToken ? `?token=${token}` : '';
+  const tokenSuffix = hasToken ? `?token=${encodeURIComponent(token)}` : '';
   // Gateway direct address for Loxone (not via HA Ingress)
-  const gatewayHost = window.location.hostname;
-  const gatewayUrl = `http://${gatewayHost}:${DIRECT_PORT}`;
+  const [gatewayUrl, setGatewayUrl] = useState(() => {
+    try {
+      return localStorage.getItem('gateway-direct-url') || window.location.origin;
+    } catch {
+      return window.location.origin;
+    }
+  });
 
   return (
     <div className="space-y-6">
@@ -89,10 +92,20 @@ export function LoxoneGuide() {
         <p className="text-gray-400">
           Anleitung zur Einbindung der Velux-Geräte in Loxone über Virtual HTTP Outputs.
         </p>
+        <label className="block mt-4 text-sm text-gray-300">
+          Direkte Gateway-Adresse (Docker: 8080, HA: 8099)
+          <input aria-label="Direkte Gateway-Adresse" type="url" value={gatewayUrl}
+            onChange={e => {
+              setGatewayUrl(e.target.value);
+              try { localStorage.setItem('gateway-direct-url', e.target.value); } catch { /* Session only when storage is unavailable. */ }
+            }}
+            className="block mt-1 w-full bg-gray-900 border border-gray-700 rounded-lg p-2" />
+        </label>
+        <p className="text-sm text-gray-400 mt-2">Die Adresse muss vom Miniserver direkt erreichbar sein. Bei Home Assistant die Ingress-Adresse durch die lokale Gateway-Adresse mit Port 8099 ersetzen.</p>
         {!hasToken && (
           <div className="mt-3 p-3 bg-green-900/30 border border-green-700 rounded-lg">
             <p className="text-sm text-green-400">
-              Authentifizierung ist deaktiviert. URLs können ohne <code className="bg-gray-900 px-1 rounded">?token=...</code> verwendet werden.
+              Kein Token im Browser gespeichert. Falls das Gateway einen Token verlangt, zuerst anmelden. Die Beispiele enthalten derzeit keinen <code className="bg-gray-900 px-1 rounded">?token=...</code> Zusatz.
             </p>
           </div>
         )}
@@ -382,7 +395,7 @@ export function LoxoneGuide() {
               </p>
             ) : (
               <p className="text-sm text-green-400 mt-4">
-                Authentifizierung ist deaktiviert (kein api_token in config.yaml).
+                Kein Token im Browser gespeichert. Prüfe in den Gateway-Einstellungen, ob ein API-Token erforderlich ist.
               </p>
             )}
           </div>
@@ -395,7 +408,7 @@ export function LoxoneGuide() {
               <ul className="list-disc list-inside space-y-1 ml-4 text-gray-400">
                 <li>Prüfe ob das Add-on in Home Assistant läuft</li>
                 <li>Prüfe die Add-on Logs in Home Assistant</li>
-                <li>Stelle sicher, dass Port {DIRECT_PORT} von der Loxone erreichbar ist</li>
+                <li>Stelle sicher, dass die direkte Gateway-Adresse vom Miniserver erreichbar ist</li>
                 <li>Gateway-Adresse: <code>{gatewayUrl}</code></li>
               </ul>
             </div>

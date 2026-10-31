@@ -22,6 +22,12 @@ Die Konfiguration erfolgt ausschliesslich über die Add-on-Einstellungen in
 Home Assistant. Mappings und UDP-Feedback werden über die REST API verwaltet
 (siehe unten) und überleben Add-on-Neustarts.
 
+Die API meldet `managed: true` unter `/api/config`. Änderungen an Zugangsdaten,
+API-Token oder Log-Level über diese API werden mit HTTP 400 abgewiesen; ändere
+sie in den HA-Optionen und starte das Add-on neu. Mappings und UDP-Einstellungen
+werden atomar in `loxone.yaml` gespeichert. Speicherfehler werden als Fehler
+zurückgegeben und ändern den laufenden Konfigurationsstand nicht.
+
 ### KLF-200 Einstellungen
 
 - **klf200_host** (erforderlich): IP-Adresse oder Hostname des KLF-200
@@ -45,6 +51,11 @@ Das Web-Interface ist über die Home Assistant Sidebar erreichbar (Ingress).
 Das Dashboard zeigt alle verbundenen Velux Geräte mit Echtzeit-Positionsanzeige.
 Geräte können geöffnet, geschlossen, gestoppt oder auf eine bestimmte Position
 gefahren werden.
+
+Das Dashboard unterscheidet bestätigte Zielbefehle von gemessenen Positionen.
+Unbekannte oder veraltete Positionen und Sensorwerte werden ausdrücklich so
+angezeigt. Loxone-Statusabfragen liefern in diesem Fall HTTP 503 und `ERROR`.
+Vollständige Statusabgleiche senden auch unveränderte Werte erneut per UDP.
 
 Das Dashboard fragt beim ersten Aufruf nach dem `api_token` und speichert ihn
 im Browser.

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Node } from '../types';
 import {
   Blinds,
@@ -9,6 +9,7 @@ import {
 
 interface NodeCardProps {
   node: Node;
+  acceptedTarget?: number;
   onSetPosition: (id: number, position: number) => void;
   onOpen: (id: number) => void;
   onClose: (id: number) => void;
@@ -17,39 +18,45 @@ interface NodeCardProps {
 
 export function NodeCard({
   node,
+  acceptedTarget,
   onSetPosition,
   onOpen,
   onClose,
   onStop,
 }: NodeCardProps) {
-  const [localPosition, setLocalPosition] = useState(node.position_percent);
+  const [localPosition, setLocalPosition] = useState(Math.max(0, node.position_percent));
+  const dirty = useRef(false);
 
   // Sync the slider with the gateway position once the node is no longer moving.
   useEffect(() => {
-    if (node.state_str !== 'Executing') {
+    if (!dirty.current && node.state_str !== 'Executing' && node.position_percent >= 0 && !node.stale) {
       setLocalPosition((current) =>
         Math.abs(current - node.position_percent) > 1 ? node.position_percent : current
       );
     }
-  }, [node.position_percent, node.state_str]);
+  }, [node.position_percent, node.state_str, node.stale]);
 
   const handlePositionChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    dirty.current = true;
     setLocalPosition(parseFloat(e.target.value));
   };
 
   const handlePositionCommit = () => {
+    if (!dirty.current) return;
+    dirty.current = false;
     onSetPosition(node.id, localPosition);
   };
 
   const isExecuting = node.state_str === 'Executing';
   // For inverted types (window openers): 0% = closed, 100% = open
   // For normal types (shutters): 0% = open, 100% = closed
-  const isOpen = node.inverted
+  const known = node.position_percent >= 0 && !node.stale;
+  const isOpen = known && (node.inverted
     ? node.position_percent > 90
-    : node.position_percent < 10;
-  const isClosed = node.inverted
+    : node.position_percent < 10);
+  const isClosed = known && (node.inverted
     ? node.position_percent < 10
-    : node.position_percent > 90;
+    : node.position_percent > 90);
 
   // Get icon based on type
   const getIcon = () => {
@@ -60,6 +67,8 @@ export function NodeCard({
 
   // Get position display
   const getPositionText = () => {
+    if (node.stale) return 'Veraltet';
+    if (!known) return 'Unbekannt';
     if (isOpen) return 'Offen';
     if (isClosed) return 'Geschlossen';
     return `${Math.round(node.position_percent)}%`;
@@ -97,6 +106,7 @@ export function NodeCard({
 
         <div className="text-right">
           <p className="text-lg font-semibold text-white">{getPositionText()}</p>
+          {acceptedTarget !== undefined && <p className="text-xs text-blue-300">Befehl angenommen: Ziel {acceptedTarget}%</p>}
           <p className={`text-xs ${getStatusColor()}`}>
             {isExecuting ? 'Bewegt sich...' : node.state_str}
           </p>
@@ -106,18 +116,23 @@ export function NodeCard({
       {/* Position Slider */}
       <div className="mb-4">
         <div className="flex justify-between text-xs text-gray-400 mb-2">
-          <span>Position</span>
+          <span>Zielposition</span>
           <span>{Math.round(localPosition)}%</span>
         </div>
         <div className="relative">
           <input
             type="range"
+            aria-label={`Zielposition ${node.name}`}
             min="0"
             max="100"
             value={localPosition}
             onChange={handlePositionChange}
             onMouseUp={handlePositionCommit}
             onTouchEnd={handlePositionCommit}
+            onBlur={handlePositionCommit}
+            onKeyUp={(e) => {
+              if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(e.key)) handlePositionCommit();
+            }}
             className="w-full"
             disabled={isExecuting}
           />
@@ -145,7 +160,7 @@ export function NodeCard({
                 disabled={isExecuting}
                 className={`
                   flex-1 py-1.5 text-sm rounded-lg transition-colors
-                  ${Math.abs(currentOpenPercent - openPercent) < 5
+                  ${known && Math.abs(currentOpenPercent - openPercent) < 5
                     ? 'bg-velux-blue text-white'
                     : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
                   }
@@ -173,12 +188,11 @@ export function NodeCard({
 
         <button
           onClick={() => onStop(node.id)}
-          disabled={!isExecuting}
           className={`
             flex items-center justify-center px-3 py-2 rounded-lg transition-colors
             ${isExecuting
               ? 'bg-yellow-600 hover:bg-yellow-500 text-white'
-              : 'bg-gray-700 text-gray-500 cursor-not-allowed'
+              : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
             }
           `}
           title="Stoppen"

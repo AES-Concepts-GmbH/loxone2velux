@@ -34,6 +34,24 @@ function renderCard(node: Node) {
 }
 
 describe('NodeCard', () => {
+  it('commits keyboard changes once and exposes a label', () => {
+    const { handlers } = renderCard(makeNode());
+    const slider = screen.getByRole('slider', { name: 'Zielposition Rollladen' });
+    fireEvent.change(slider, { target: { value: '42' } });
+    fireEvent.keyUp(slider, { key: 'ArrowRight' });
+    fireEvent.blur(slider);
+    expect(handlers.onSetPosition).toHaveBeenCalledTimes(1);
+    expect(handlers.onSetPosition).toHaveBeenCalledWith(1, 42);
+  });
+
+  it('shows unknown and stale positions without claiming the device is closed', () => {
+    const { unmount } = renderCard(makeNode({ position_percent: -1 }));
+    expect(screen.getByText('Unbekannt')).toBeInTheDocument();
+    unmount();
+    renderCard(makeNode({ position_percent: 100, stale: true }));
+    expect(screen.getByText('Veraltet')).toBeInTheDocument();
+    expect(screen.queryByText('Geschlossen', { selector: 'p.text-lg' })).not.toBeInTheDocument();
+  });
   it('shows name, id, type and "Offen" for position 0', () => {
     renderCard(makeNode());
     expect(screen.getByText('Rollladen')).toBeInTheDocument();

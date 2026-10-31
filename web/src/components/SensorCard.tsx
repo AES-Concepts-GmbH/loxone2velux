@@ -8,6 +8,7 @@ interface SensorCardProps {
 }
 
 export function SensorCard({ sensors, onRefresh, isRefreshing }: SensorCardProps) {
+  const known = sensors?.valid === true;
   const formatLastUpdate = (dateStr: string | undefined) => {
     if (!dateStr || dateStr === '0001-01-01T00:00:00Z') {
       return 'Noch nicht abgefragt';
@@ -34,24 +35,24 @@ export function SensorCard({ sensors, onRefresh, isRefreshing }: SensorCardProps
         {/* Rain Sensor */}
         <div className={`
           p-4 rounded-lg flex flex-col items-center gap-2 transition-colors
-          ${sensors?.rain_detected ? 'bg-blue-600' : 'bg-gray-700'}
+          ${known && sensors?.rain_detected ? 'bg-blue-600' : 'bg-gray-700'}
         `}>
           <CloudRain size={32} className="text-white" />
           <span className="text-white font-medium">Regen</span>
-          <span className={`text-sm ${sensors?.rain_detected ? 'text-blue-200' : 'text-gray-400'}`}>
-            {sensors?.rain_detected ? 'Erkannt' : 'Kein Regen'}
+          <span className={`text-sm ${known && sensors?.rain_detected ? 'text-blue-200' : 'text-gray-400'}`}>
+            {!known ? 'Unbekannt / veraltet' : sensors?.rain_detected ? 'Erkannt' : 'Kein Regen'}
           </span>
         </div>
 
         {/* Wind Sensor */}
         <div className={`
           p-4 rounded-lg flex flex-col items-center gap-2 transition-colors
-          ${sensors?.wind_detected ? 'bg-amber-600' : 'bg-gray-700'}
+          ${known && sensors?.wind_detected ? 'bg-amber-600' : 'bg-gray-700'}
         `}>
           <Wind size={32} className="text-white" />
           <span className="text-white font-medium">Wind</span>
-          <span className={`text-sm ${sensors?.wind_detected ? 'text-amber-200' : 'text-gray-400'}`}>
-            {sensors?.wind_detected ? 'Erkannt' : 'Kein Wind'}
+          <span className={`text-sm ${known && sensors?.wind_detected ? 'text-amber-200' : 'text-gray-400'}`}>
+            {!known ? 'Unbekannt / veraltet' : sensors?.wind_detected ? 'Erkannt' : 'Kein Wind'}
           </span>
         </div>
       </div>

@@ -4,6 +4,7 @@ import { Blinds, RefreshCw } from 'lucide-react';
 
 interface NodeListProps {
   nodes: Node[];
+  targets?: Record<number, number>;
   loading: boolean;
   onSetPosition: (id: number, position: number) => void;
   onOpen: (id: number) => void;
@@ -14,6 +15,7 @@ interface NodeListProps {
 
 export function NodeList({
   nodes,
+  targets = {},
   loading,
   onSetPosition,
   onOpen,
@@ -74,6 +76,7 @@ export function NodeList({
             <NodeCard
               key={node.id}
               node={node}
+              acceptedTarget={targets[node.id]}
               onSetPosition={onSetPosition}
               onOpen={onOpen}
               onClose={onClose}

@@ -21,7 +21,7 @@ import (
 type ConfigManager interface {
 	GetConfig() *config.Config
 	GetAPIToken() string
-	UpdateConfig(cfg *config.Config) error
+	ModifyConfig(func(*config.Config) error) error
 	GetConfigPath() string
 }
 
@@ -291,6 +291,10 @@ func (h *Handlers) LoxoneGetPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if node.Stale || node.PositionPercent < 0 {
+		writePlain(w, http.StatusServiceUnavailable, "ERROR")
+		return
+	}
 	writePlain(w, http.StatusOK, strconv.Itoa(int(math.Round(node.PositionPercent))))
 }
 
@@ -325,18 +329,32 @@ func boolToDigit(b bool) string {
 // LoxoneSensorStatus returns all sensor values in Loxone-friendly format
 func (h *Handlers) LoxoneSensorStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.gateway.GetSensorStatus()
+	if !status.Valid {
+		writePlain(w, http.StatusServiceUnavailable, "ERROR")
+		return
+	}
 	// Format: rain;wind (e.g., "0;0" or "1;0")
 	writePlain(w, http.StatusOK, boolToDigit(status.RainDetected)+";"+boolToDigit(status.WindDetected))
 }
 
 // LoxoneRainStatus returns just the rain sensor value (0 or 1)
 func (h *Handlers) LoxoneRainStatus(w http.ResponseWriter, r *http.Request) {
-	writePlain(w, http.StatusOK, boolToDigit(h.gateway.GetSensorStatus().RainDetected))
+	status := h.gateway.GetSensorStatus()
+	if !status.Valid {
+		writePlain(w, http.StatusServiceUnavailable, "ERROR")
+		return
+	}
+	writePlain(w, http.StatusOK, boolToDigit(status.RainDetected))
 }
 
 // LoxoneWindStatus returns just the wind sensor value (0 or 1)
 func (h *Handlers) LoxoneWindStatus(w http.ResponseWriter, r *http.Request) {
-	writePlain(w, http.StatusOK, boolToDigit(h.gateway.GetSensorStatus().WindDetected))
+	status := h.gateway.GetSensorStatus()
+	if !status.Valid {
+		writePlain(w, http.StatusServiceUnavailable, "ERROR")
+		return
+	}
+	writePlain(w, http.StatusOK, boolToDigit(status.WindDetected))
 }
 
 // Configuration endpoints
@@ -344,6 +362,7 @@ func (h *Handlers) LoxoneWindStatus(w http.ResponseWriter, r *http.Request) {
 // ConfigResponse is the JSON structure returned by GET /api/config. Secrets
 // are never returned; *_set flags tell whether a value is configured.
 type ConfigResponse struct {
+	Managed bool          `json:"managed"`
 	KLF200  ConfigKLF200  `json:"klf200"`
 	Server  ConfigServer  `json:"server"`
 	Loxone  ConfigLoxone  `json:"loxone"`
@@ -392,7 +411,12 @@ type ConfigUpdateRequest struct {
 }
 
 func (h *Handlers) configResponse(cfg *config.Config) ConfigResponse {
+	managed := false
+	if m, ok := h.configMgr.(interface{ ManagedConfig() bool }); ok {
+		managed = m.ManagedConfig()
+	}
 	return ConfigResponse{
+		Managed: managed,
 		KLF200: ConfigKLF200{
 			Host:              cfg.KLF200.Host,
 			Port:              cfg.KLF200.Port,
@@ -441,46 +465,56 @@ func (h *Handlers) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get current config and update it
-	cfg := h.configMgr.GetConfig()
+	err := h.modifyConfig(w, func(cfg *config.Config) error {
 
-	if req.KLF200.Host != nil {
-		cfg.KLF200.Host = *req.KLF200.Host
-	}
-	if req.KLF200.Port != nil {
-		cfg.KLF200.Port = *req.KLF200.Port
-	}
-	if req.KLF200.Password != nil && *req.KLF200.Password != "" {
-		cfg.KLF200.Password = *req.KLF200.Password
-	}
-	if req.Server.APIToken != nil {
-		cfg.Server.APIToken = *req.Server.APIToken
-	}
-	if req.Logging.Level != nil {
-		cfg.Logging.Level = *req.Logging.Level
-	}
+		if req.KLF200.Host != nil {
+			cfg.KLF200.Host = *req.KLF200.Host
+		}
+		if req.KLF200.Port != nil {
+			cfg.KLF200.Port = *req.KLF200.Port
+		}
+		if req.KLF200.Password != nil && *req.KLF200.Password != "" {
+			cfg.KLF200.Password = *req.KLF200.Password
+		}
+		if req.Server.APIToken != nil {
+			cfg.Server.APIToken = *req.Server.APIToken
+		}
+		if req.Logging.Level != nil {
+			cfg.Logging.Level = *req.Logging.Level
+		}
 
-	if err := h.saveConfig(w, cfg, "Failed to save configuration"); err != nil {
+		return nil
+	}, "Failed to save configuration")
+	if err != nil {
 		return
 	}
+	cfg := h.configMgr.GetConfig()
 
 	h.logger.Info().Msg("Configuration updated")
 
 	writeJSON(w, http.StatusOK, h.configResponse(cfg))
 }
 
-// saveConfig persists cfg and writes an error response on failure
+// modifyConfig applies an atomic change and writes an error response on failure
 // (400 for validation errors, 500 otherwise).
-func (h *Handlers) saveConfig(w http.ResponseWriter, cfg *config.Config, message string) error {
-	err := h.configMgr.UpdateConfig(cfg)
+func (h *Handlers) modifyConfig(w http.ResponseWriter, change func(*config.Config) error, message string) error {
+	err := h.configMgr.ModifyConfig(change)
 	if err == nil {
 		return nil
 	}
 	status := http.StatusInternalServerError
+	if errors.Is(err, errMappingNotFound) {
+		status = http.StatusNotFound
+	}
 	if config.IsValidationError(err) {
 		status = http.StatusBadRequest
 	}
-	writeError(w, status, message, err.Error())
+	h.logger.Error().Err(err).Msg(message)
+	details := ""
+	if status < 500 {
+		details = err.Error()
+	}
+	writeError(w, status, message, details)
 	return err
 }
 
@@ -560,6 +594,8 @@ func (h *Handlers) ListMappings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var errMappingNotFound = errors.New("mapping not found")
+
 // CreateMapping creates a new node mapping
 func (h *Handlers) CreateMapping(w http.ResponseWriter, r *http.Request) {
 	var req mappingRequest
@@ -586,9 +622,10 @@ func (h *Handlers) CreateMapping(w http.ResponseWriter, r *http.Request) {
 		Enabled:  req.enabled(),
 	}
 
-	cfg := h.configMgr.GetConfig()
-	cfg.Loxone.Mappings = append(cfg.Loxone.Mappings, mapping)
-	if err := h.saveConfig(w, cfg, "Failed to save mapping"); err != nil {
+	if err := h.modifyConfig(w, func(cfg *config.Config) error {
+		cfg.Loxone.Mappings = append(cfg.Loxone.Mappings, mapping)
+		return nil
+	}, "Failed to save mapping"); err != nil {
 		return
 	}
 
@@ -610,28 +647,29 @@ func (h *Handlers) UpdateMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := h.configMgr.GetConfig()
 	var updated *config.NodeMapping
-	for i := range cfg.Loxone.Mappings {
-		if cfg.Loxone.Mappings[i].ID == mappingID {
-			cfg.Loxone.Mappings[i] = config.NodeMapping{
-				ID:       mappingID,
-				Name:     req.Name,
-				NodeID:   req.NodeID,
-				LoxoneID: req.LoxoneID,
-				Enabled:  req.enabled(),
+	if err := h.modifyConfig(w, func(cfg *config.Config) error {
+
+		for i := range cfg.Loxone.Mappings {
+			if cfg.Loxone.Mappings[i].ID == mappingID {
+				cfg.Loxone.Mappings[i] = config.NodeMapping{
+					ID:       mappingID,
+					Name:     req.Name,
+					NodeID:   req.NodeID,
+					LoxoneID: req.LoxoneID,
+					Enabled:  req.enabled(),
+				}
+				updated = &cfg.Loxone.Mappings[i]
+				break
 			}
-			updated = &cfg.Loxone.Mappings[i]
-			break
 		}
-	}
 
-	if updated == nil {
-		writeError(w, http.StatusNotFound, "Mapping not found", "")
-		return
-	}
+		if updated == nil {
+			return errMappingNotFound
+		}
 
-	if err := h.saveConfig(w, cfg, "Failed to save mapping"); err != nil {
+		return nil
+	}, "Failed to save mapping"); err != nil {
 		return
 	}
 
@@ -642,25 +680,26 @@ func (h *Handlers) UpdateMapping(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) DeleteMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mappingID")
 
-	cfg := h.configMgr.GetConfig()
-	newMappings := make([]config.NodeMapping, 0, len(cfg.Loxone.Mappings))
-	found := false
+	if err := h.modifyConfig(w, func(cfg *config.Config) error {
 
-	for _, m := range cfg.Loxone.Mappings {
-		if m.ID == mappingID {
-			found = true
-			continue
+		newMappings := make([]config.NodeMapping, 0, len(cfg.Loxone.Mappings))
+		found := false
+
+		for _, m := range cfg.Loxone.Mappings {
+			if m.ID == mappingID {
+				found = true
+				continue
+			}
+			newMappings = append(newMappings, m)
 		}
-		newMappings = append(newMappings, m)
-	}
 
-	if !found {
-		writeError(w, http.StatusNotFound, "Mapping not found", "")
-		return
-	}
+		if !found {
+			return errMappingNotFound
+		}
 
-	cfg.Loxone.Mappings = newMappings
-	if err := h.saveConfig(w, cfg, "Failed to delete mapping"); err != nil {
+		cfg.Loxone.Mappings = newMappings
+		return nil
+	}, "Failed to delete mapping"); err != nil {
 		return
 	}
 
@@ -686,10 +725,10 @@ func (h *Handlers) UpdateLoxoneUDPConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	cfg := h.configMgr.GetConfig()
-	cfg.Loxone.UDPFeedback = req
-
-	if err := h.saveConfig(w, cfg, "Failed to save config"); err != nil {
+	if err := h.modifyConfig(w, func(cfg *config.Config) error {
+		cfg.Loxone.UDPFeedback = req
+		return nil
+	}, "Failed to save config"); err != nil {
 		return
 	}
 
@@ -707,6 +746,10 @@ func (h *Handlers) TestUDP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	udpSender.Send("test", "ping", 1)
+	if err := udpSender.Send("test", "ping", 1); err != nil {
+		h.logger.Error().Err(err).Msg("UDP test failed")
+		writeError(w, http.StatusBadGateway, "UDP test failed", "")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "test sent"})
 }

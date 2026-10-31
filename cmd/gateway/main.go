@@ -26,6 +26,7 @@ func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	showVersion := flag.Bool("version", false, "Show version and exit")
+	managed := flag.Bool("managed-config", false, "Home Assistant options manage non-Loxone settings")
 	flag.Parse()
 
 	if *showVersion {
@@ -61,11 +62,17 @@ func main() {
 	// This is kept separate from config.yaml so mappings and UDP feedback
 	// survive Home Assistant add-on restarts that regenerate config.yaml.
 	loxonePath := filepath.Join(filepath.Dir(*configPath), "loxone.yaml")
-	if lc, lerr := config.LoadLoxoneConfig(loxonePath); lerr == nil {
-		cfg.Loxone = *lc
-		logger.Info().Str("path", loxonePath).Msg("Loaded Loxone configuration from sidecar")
-	} else if !errors.Is(lerr, fs.ErrNotExist) {
-		logger.Warn().Err(lerr).Str("path", loxonePath).Msg("Failed to load Loxone sidecar config")
+	if *managed {
+		if lc, lerr := config.LoadLoxoneConfig(loxonePath); lerr == nil {
+			cfg.Loxone = *lc
+			logger.Info().Str("path", loxonePath).Msg("Loaded Loxone configuration from sidecar")
+		} else if !errors.Is(lerr, fs.ErrNotExist) {
+			logger.Error().Err(lerr).Msg("Failed to load Loxone sidecar config")
+			os.Exit(1)
+		}
+	} else if err := config.MigrateLoxoneSidecar(*configPath, loxonePath, cfg); err != nil {
+		logger.Error().Err(err).Msg("Failed to migrate legacy Loxone configuration")
+		os.Exit(1)
 	}
 
 	logger.Info().
@@ -89,21 +96,28 @@ func main() {
 
 	// Create config manager
 	configMgr := configmgr.New(cfg, *configPath, loxonePath, gw, logger)
+	if *managed {
+		configMgr.SetManagedConfig()
+	}
 
 	// Create and start API server
 	server := api.NewServer(&cfg.Server, gw, logger, configMgr, version)
 
 	// Start server in goroutine
-	go func() {
-		if err := server.Start(); err != nil {
-			logger.Fatal().Err(err).Msg("Server error")
-		}
-	}()
+	serverErrors := make(chan error, 1)
+	go func() { serverErrors <- server.Start() }()
 
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	serverFailed := false
+	select {
+	case <-quit:
+	case err := <-serverErrors:
+		logger.Error().Err(err).Msg("HTTP server stopped")
+		serverFailed = err != nil
+	}
+	signal.Stop(quit)
 
 	logger.Info().Msg("Shutting down...")
 
@@ -120,6 +134,9 @@ func main() {
 	}
 
 	logger.Info().Msg("Goodbye!")
+	if serverFailed {
+		os.Exit(1)
+	}
 }
 
 func setupLogger(cfg config.LoggingConfig) zerolog.Logger {

@@ -8,7 +8,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/data
     environment:
       - TZ=Europe/Zurich
     # Alternative: Use environment variables instead of config file

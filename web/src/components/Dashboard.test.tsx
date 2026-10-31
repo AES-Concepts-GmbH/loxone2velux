@@ -21,7 +21,7 @@ const node: Node = {
 };
 
 const health = { status: 'ok' as const, connected: true, node_count: 1, version: '1.3.0' };
-const sensors = { rain_detected: false, wind_detected: false, last_update: new Date().toISOString() };
+const sensors = { valid: true, rain_detected: false, wind_detected: false, last_update: new Date().toISOString() };
 
 describe('Dashboard', () => {
   beforeEach(() => {
@@ -69,7 +69,18 @@ describe('Dashboard', () => {
     expect(await screen.findByText('Health 502 from /health')).toBeInTheDocument();
   });
 
-  it('sends commands and applies optimistic updates', async () => {
+  it('clears a previously connected status when polling fails', async () => {
+    render(<Dashboard />);
+    await screen.findByText('Verbunden');
+    vi.spyOn(api, 'getHealth').mockRejectedValue(new Error('offline'));
+    fireEvent.click(screen.getByTitle('Aktualisieren'));
+    expect(await screen.findByText('Status unbekannt')).toBeInTheDocument();
+    expect(screen.queryByText('Verbunden')).not.toBeInTheDocument();
+    expect(screen.getByText('Veraltet')).toBeInTheDocument();
+    expect(screen.queryByText('Kein Regen')).not.toBeInTheDocument();
+  });
+
+  it('keeps measured positions while showing accepted targets', async () => {
     const open = vi.spyOn(api, 'openNode').mockResolvedValue({ success: true, node_id: 1 });
     const close = vi.spyOn(api, 'closeNode').mockResolvedValue({ success: true, node_id: 1 });
     const setPos = vi.spyOn(api, 'setNodePosition').mockResolvedValue({ success: true, node_id: 1 });
@@ -80,7 +91,8 @@ describe('Dashboard', () => {
 
     fireEvent.click(screen.getByTitle('Vollständig schließen'));
     await waitFor(() => expect(close).toHaveBeenCalledWith(1));
-    expect(await screen.findByText('Geschlossen', { selector: 'p.text-lg' })).toBeInTheDocument();
+    expect(await screen.findByText('Befehl angenommen: Ziel 100%')).toBeInTheDocument();
+    expect(screen.getByText('Offen', { selector: 'p.text-lg' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByTitle('Vollständig öffnen'));
     await waitFor(() => expect(open).toHaveBeenCalledWith(1));

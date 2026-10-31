@@ -1,2 +1,7 @@
-# Force LF line endings for shell scripts (required for Linux containers)
+# Keep source files consistent across Windows and Linux.
+* text=auto
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+# Required for Linux containers.
 *.sh text eol=lf

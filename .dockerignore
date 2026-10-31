@@ -17,6 +17,11 @@
 
 # Config with secrets
 config.yaml
+loxone.yaml
+loxone.yaml.legacy
+data/
+.env
+.env.*
 
 # Claude
 .claude/
@@ -24,6 +29,16 @@ config.yaml
 # Node
 web/node_modules/
 web/dist/
+web/coverage/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+
+# Local Go workspace and test artifacts
+go.work
+go.work.sum
+*.test
+*.out
 
 # Documentation
 *.md

@@ -52,6 +52,7 @@ type Service struct {
 	mu       sync.RWMutex
 	started  bool
 	stopChan chan struct{}
+	cancel   context.CancelFunc
 	// per-loop reload signals (buffered, one per loop that has a ticker)
 	reloadRefresh   chan struct{}
 	reloadReconnect chan struct{}
@@ -127,7 +128,10 @@ func (s *Service) Start(ctx context.Context) error {
 		return nil
 	}
 	s.started = true
+	s.wg.Add(1) // Stop also waits for an initial connection in progress.
+	ctx, s.cancel = context.WithCancel(ctx)
 	s.mu.Unlock()
+	defer s.wg.Done()
 
 	cfg := s.config()
 	s.logger.Info().
@@ -152,15 +156,23 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	s.wg.Add(3)
-	go s.refreshLoop()
-	go s.reconnectLoop()
-	go s.keepAliveLoop()
+	go s.refreshLoop(ctx)
+	go s.reconnectLoop(ctx)
+	go s.keepAliveLoop(ctx)
 
 	return connectErr
 }
 
 // connect establishes connection to KLF-200
 func (s *Service) connect(ctx context.Context) error {
+	select {
+	case <-s.stopChan:
+		return fmt.Errorf("gateway service stopped")
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !s.IsConfigured() {
 		return ErrNotConfigured
 	}
@@ -192,13 +204,18 @@ func (s *Service) refreshNodes(ctx context.Context) error {
 	}
 
 	s.nodes.SetNodes(nodes)
+	// A bounded snapshot (at most the configured mappings) repairs lost UDP
+	// packets and initializes a restarted Miniserver without device motion.
+	for _, node := range nodes {
+		s.sendNodeUDPFeedback(node)
+	}
 	s.logger.Info().Int("count", len(nodes)).Msg("Refreshed nodes")
 
 	return nil
 }
 
 // refreshLoop periodically refreshes node information and sensor status.
-func (s *Service) refreshLoop() {
+func (s *Service) refreshLoop(parent context.Context) {
 	defer s.wg.Done()
 
 	ticker := time.NewTicker(s.config().RefreshInterval)
@@ -206,6 +223,8 @@ func (s *Service) refreshLoop() {
 
 	for {
 		select {
+		case <-parent.Done():
+			return
 		case <-s.stopChan:
 			return
 		case <-s.reloadRefresh:
@@ -214,7 +233,7 @@ func (s *Service) refreshLoop() {
 			if !s.client.IsAuthenticated() {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+			ctx, cancel := context.WithTimeout(parent, operationTimeout)
 			if err := s.refreshNodes(ctx); err != nil {
 				s.logger.Warn().Err(err).Msg("Failed to refresh nodes")
 			} else if err := s.RefreshSensorStatus(ctx); err != nil {
@@ -226,7 +245,7 @@ func (s *Service) refreshLoop() {
 }
 
 // reconnectLoop handles reconnection
-func (s *Service) reconnectLoop() {
+func (s *Service) reconnectLoop(parent context.Context) {
 	defer s.wg.Done()
 
 	ticker := time.NewTicker(s.config().ReconnectInterval)
@@ -234,6 +253,8 @@ func (s *Service) reconnectLoop() {
 
 	for {
 		select {
+		case <-parent.Done():
+			return
 		case <-s.stopChan:
 			return
 		case <-s.reloadReconnect:
@@ -243,7 +264,7 @@ func (s *Service) reconnectLoop() {
 				continue
 			}
 			s.logger.Info().Msg("Attempting to reconnect")
-			ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+			ctx, cancel := context.WithTimeout(parent, operationTimeout)
 			if err := s.connect(ctx); err != nil {
 				s.logger.Warn().Err(err).Msg("Reconnect failed")
 			} else {
@@ -257,7 +278,7 @@ func (s *Service) reconnectLoop() {
 // keepAliveLoop sends periodic GW_GET_STATE_REQ frames so the KLF-200 does
 // not drop the idle connection, and tears the connection down when the
 // gateway stops answering (the reconnect loop then re-establishes it).
-func (s *Service) keepAliveLoop() {
+func (s *Service) keepAliveLoop(parent context.Context) {
 	defer s.wg.Done()
 
 	ticker := time.NewTicker(keepAliveInterval)
@@ -266,6 +287,8 @@ func (s *Service) keepAliveLoop() {
 	failures := 0
 	for {
 		select {
+		case <-parent.Done():
+			return
 		case <-s.stopChan:
 			return
 		case <-ticker.C:
@@ -273,7 +296,7 @@ func (s *Service) keepAliveLoop() {
 				failures = 0
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), keepAliveTimeout)
+			ctx, cancel := context.WithTimeout(parent, keepAliveTimeout)
 			err := s.client.GetState(ctx)
 			cancel()
 			if err == nil {
@@ -317,8 +340,12 @@ func (s *Service) sendNodeUDPFeedback(node *klf200.Node) {
 	// Only forward position/target when the update carries real position data.
 	// State-only updates (run status) would otherwise report a bogus 0%.
 	if node.PositionValid {
-		s.udpSender.Send(id, "position", int(math.Round(node.PositionPercent)))
-		s.udpSender.Send(id, "target", int(math.Round(node.TargetPercent)))
+		if node.PositionPercent >= 0 {
+			s.udpSender.Send(id, "position", int(math.Round(node.PositionPercent)))
+		}
+		if node.TargetPercent >= 0 {
+			s.udpSender.Send(id, "target", int(math.Round(node.TargetPercent)))
+		}
 	}
 	s.udpSender.Send(id, "state", int(node.State))
 }
@@ -330,7 +357,7 @@ func (s *Service) handleSensorUpdate(status klf200.SensorStatus) {
 		Bool("wind", status.WindDetected).
 		Msg("Sensor status changed")
 
-	if !s.udpSender.IsEnabled() {
+	if !s.udpSender.IsEnabled() || !status.Valid {
 		return
 	}
 
@@ -366,6 +393,9 @@ func (s *Service) Stop() error {
 	s.logger.Info().Msg("Stopping gateway service")
 
 	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	select {
 	case <-s.stopChan:
 		// already stopped
@@ -398,12 +428,24 @@ func (s *Service) IsConnected() bool {
 
 // GetNodes returns all nodes
 func (s *Service) GetNodes() []*klf200.Node {
-	return s.nodes.GetAllNodes()
+	nodes := s.nodes.GetAllNodes()
+	for _, node := range nodes {
+		s.markStale(node)
+	}
+	return nodes
 }
 
 // GetNode returns a node by ID
 func (s *Service) GetNode(id uint8) (*klf200.Node, bool) {
-	return s.nodes.GetNode(id)
+	node, ok := s.nodes.GetNode(id)
+	if ok {
+		s.markStale(node)
+	}
+	return node, ok
+}
+
+func (s *Service) markStale(node *klf200.Node) {
+	node.Stale = !s.IsConnected() || node.LastUpdate.IsZero() || time.Since(node.LastUpdate) > 2*s.config().RefreshInterval
 }
 
 // GetNodeCount returns the number of nodes
@@ -449,7 +491,9 @@ func (s *Service) StopNode(ctx context.Context, nodeID uint8) error {
 
 // GetSensorStatus returns the current sensor status
 func (s *Service) GetSensorStatus() klf200.SensorStatus {
-	return s.client.GetSensorStatus()
+	status := s.client.GetSensorStatus()
+	status.Valid = status.Valid && s.IsConnected() && !status.LastUpdate.IsZero() && time.Since(status.LastUpdate) <= 2*s.config().RefreshInterval
+	return status
 }
 
 // RefreshSensorStatus queries the KLF-200 for current sensor/limitation status

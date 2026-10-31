@@ -21,12 +21,23 @@ standalone Docker container.
 ## Quick start (Docker)
 
 ```bash
-cp config.example.yaml config.yaml   # edit klf200.host / klf200.password / server.api_token
+mkdir -p data
+cp config.example.yaml data/config.yaml   # edit klf200.host / klf200.password / server.api_token
+# On Linux, give the container user ownership of its writable data directory:
+sudo chown -R 1000:1000 data
 docker compose up -d
 ```
 
 Without a config file the gateway starts with defaults and reads
 `KLF200_HOST` and `KLF200_PASSWORD` from the environment.
+
+The container stores its complete configuration in `/data/config.yaml`.
+Mount the entire `/data` directory read-write: saving uses an atomic file
+replacement, which cannot work with a single-file bind mount. Existing Docker
+installations must move `./config.yaml` to `./data/config.yaml` and, if present,
+`./loxone.yaml` to `./data/loxone.yaml`. Back up both files first. On first startup
+the standalone gateway merges the legacy sidecar into the complete config and
+retains it as `loxone.yaml.legacy`. Subsequent updates use only `config.yaml`.
 
 The dashboard is then available on `http://localhost:8080/`, the API on
 `/api/...` and the Loxone endpoints on `/loxone/...`.
@@ -59,6 +70,19 @@ described in [`loxone2velux/DOCS.md`](loxone2velux/DOCS.md).
 With `server.api_token` set, pass the token as `Authorization: Bearer <token>`
 or `?token=<token>`. Position semantics: 0 = open, 100 = closed.
 
+Unknown raw positions use `position_percent: -1`; node responses also include
+`stale`. Sensor responses include `valid`, which is true only after a complete
+refresh on a live connection and expires after twice the refresh interval.
+Loxone status endpoints return HTTP 503 and `ERROR` for unknown or stale data;
+UDP skips unknown position/target values. Complete refreshes resend mapped
+positions and valid sensor states to repair lost UDP feedback.
+
+In the HA add-on, `GET /api/config` reports `managed: true`. Change connection
+settings, API token and log level through HA add-on options. API attempts to
+change these fields are rejected with HTTP 400. Mappings and UDP settings remain
+editable and are stored atomically in `loxone.yaml`; standalone mode stores all
+settings in a single complete configuration file.
+
 ## Security notes
 
 - **Set an API token.** Without one, anyone who can reach the HTTP port can
@@ -85,6 +109,14 @@ service and the HTTP API run against.
 The Go binary serves `./web/dist` when present. For frontend development run
 `npm run dev` in `web/`; the Vite dev server proxies `/api` and `/health` to
 `localhost:8080`.
+
+## Repository notes
+
+The [quality review and outstanding findings](docs/QUALITY_REVIEW.md) track
+known issues and follow-up work.
+
+Local runtime configuration (`config.yaml`, `loxone.yaml`, `.env`), test
+coverage and generated frontend files are excluded from version control.
 
 ## License
 

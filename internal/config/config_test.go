@@ -153,3 +153,83 @@ func TestSaveAndLoxoneSidecar(t *testing.T) {
 		t.Errorf("expected validation error, got %v", err)
 	}
 }
+
+func TestSaveFailurePreservesExistingFile(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("requires Unix directory permissions and a non-root user")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := DefaultConfig()
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	cfg.Server.APIToken = "0123456789abcdef"
+	if err := cfg.Save(path); err == nil {
+		t.Fatal("save unexpectedly succeeded")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("failed save modified previous config")
+	}
+}
+
+func TestStandaloneSidecarMigrationDoesNotResurrectOldMappings(t *testing.T) {
+	dir := t.TempDir()
+	path, side := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "loxone.yaml")
+	cfg := DefaultConfig()
+	legacy := &LoxoneConfig{Mappings: []NodeMapping{{ID: "old", LoxoneID: "old"}}}
+	if err := SaveLoxoneConfig(side, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLoxoneSidecar(path, side, cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := Load(path)
+	if err != nil || len(saved.Loxone.Mappings) != 1 {
+		t.Fatalf("migration: %+v %v", saved, err)
+	}
+	if _, err := os.Stat(side + ".legacy"); err != nil {
+		t.Fatal("legacy backup missing")
+	}
+	if _, err := os.Stat(side); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("legacy sidecar still active")
+	}
+	cfg.Loxone.Mappings = nil
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLoxoneSidecar(path, side, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Loxone.Mappings) != 0 {
+		t.Fatal("old mappings resurrected")
+	}
+}
+
+func TestFailedMigrationPreservesLegacyData(t *testing.T) {
+	dir := t.TempDir()
+	side := filepath.Join(dir, "loxone.yaml")
+	legacy := &LoxoneConfig{Mappings: []NodeMapping{{ID: "old", LoxoneID: "old"}}}
+	if err := SaveLoxoneConfig(side, legacy); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	if err := MigrateLoxoneSidecar(filepath.Join(dir, "missing", "config.yaml"), side, cfg); err == nil {
+		t.Fatal("expected migration failure")
+	}
+	if len(cfg.Loxone.Mappings) != 0 {
+		t.Fatal("failed migration changed runtime")
+	}
+	if _, err := LoadLoxoneConfig(side); err != nil {
+		t.Fatal("legacy data lost", err)
+	}
+}

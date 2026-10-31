@@ -1,9 +1,41 @@
 # Qualitätsprüfung – Befunde und Bearbeitungsplan
 
 Prüfdatum: 31.10.2026  
-Status: Alle nachfolgenden Punkte sind offen. Es wurden im Rahmen der Prüfung keine Fehlerbehebungen umgesetzt.
+Umsetzungsstand: Q-01 bis Q-14 im Arbeitsstand umgesetzt. Die Befunde unten dokumentieren den ursprünglichen Prüfstand; Zeilenangaben und Hinweise auf frühere Testerwartungen sind historisch. Hardware- und Supervisor-Abnahme stehen weiterhin aus.
 
-## Umfang und Validierung
+## Umsetzung und erneute Validierung (31.10.2026)
+
+| Befund | Änderung | Nachweis |
+| --- | --- | --- |
+| Q-01 / Q-07 | Atomare Dateiersetzung (temporäre Datei, Sync, Rename, 0600); Fehler vor Laufzeitübernahme; pro Betriebsart genau eine autoritative Datei | Manager-/API-Fehlertests; vorhandene Datei bleibt bei echtem Schreibfehler erhalten (Linux, Benutzer 1000) |
+| Q-02 | Beschreibbares Docker-Datenverzeichnis unter `/data`; Konfiguration unter `/data/config.yaml` | Gebautes Image als UID 1000: Mapping und Log-Level speichern, Container neu erstellen, beide Werte und Dateirechte prüfen |
+| Q-03 | `ModifyConfig` serialisiert Lesen, Ändern, Prüfen, Speichern und Anwenden; alle schreibenden Handler verwenden diese Operation | Gleichzeitige HTTP-Anlagen und Manager-Änderungen; nach Laden alle 12 Mappings vorhanden |
+| Q-04 | Abbrechbare Exchange-Warteschlange, Kontextprüfung vor dem Senden, kontextgebundene Schreibfrist, Vorrang für wartende Stop-Befehle | Abgelaufener Befehl erscheint nicht auf der simulierten Verbindung; Queue-Test prüft Stop vor wartenden Bewegungsbefehlen |
+| Q-05 | Unbekannte Position = -1; Alter und Verbindung bestimmen `stale`/`valid`; unbekannte Loxone-Werte liefern 503/ERROR; UDP überspringt unbekannte Positionen | Backend-/Frontend-Tests für unbekannte Positionen, fehlende Sensoren und Verbindungsverlust |
+| Q-06 | Session- und Node-Zuordnung, eindeutige Antworten und vollständige Sammlung über alle Chunks; kein neuer Gesamtzeitstempel bei Teilantwort | Simulatorfälle: fehlende Antwort, Duplikat, falsche Session; vorherige Werte bleiben erhalten und werden ungültig markiert |
+| Q-08 | Angenommene Ziele getrennt vom Istwert; Polling-Fehler entwerten Anzeigen; HTTP-Abfragen sind zeitlich begrenzt | Dashboard-Test für Annahme ohne Positionsrückmeldung und Verbindungsverlust nach erfolgreicher Abfrage |
+| Q-09 | Add-on startet mit `-managed-config`; HA verwaltet Zugangsdaten, Token und Log-Level; API lehnt deren Änderung ab; nur Loxone-Sidecar wird gespeichert | Tests für verwaltete Einstellungen, unveränderte HA-Datei und Sidecar-Schreibfehler; README/DOCS angepasst |
+| Q-10 | Initiale und periodische Refreshes senden Zustands-Snapshots, auch ohne Wertänderung; Mapping-Liste auf 1000 begrenzt | UDP-Test für wiederholte identische Positionen und Sensorwerte |
+| Q-11 | Beschrifteter Zielregler mit Keyboard-/Blur-Commit und Unterdrückung doppelter Commits; Stop auch bei unsicherem Bewegungsstatus erreichbar | Tastatur-, Maus- und Doppel-Commit-Tests |
+| Q-12 | Editierbare direkte Gateway-Adresse; Query-Token URL-kodiert; fehlender Browser-Token bedeutet nicht automatisch deaktivierte Authentifizierung | Anleitungstest mit reservierten Token-Zeichen und eigener Gateway-Adresse |
+| Q-13 | SLIP-Puffer auf 514 kodierte Bytes begrenzt (257 dekodierte Bytes); Verwerfen bis zur nächsten Begrenzung | Übergrosser Datenstrom, danach erfolgreiche gültige Antwort |
+| Q-14 | Regressionstests und CI für Container-Persistenz sowie npm-/Go-Sicherheitsaudits ergänzt | Linux-Race-Check, Coverage, Frontend-Tests/Build, lokaler Container-Smoke-Test |
+
+Ausserdem: UDP-Testmeldungen geben Socketfehler zurück; Konfigurationswechsel bereiten den UDP-Socket vor dem Speichern vor. Hintergrundoperationen übernehmen den Service-Kontext und werden beim Stop abgebrochen. HTTP-Startfehler führen nach geordnetem Shutdown zu einem Fehler-Exit.
+
+Bestehende Standalone-Sidecars werden einmalig in die vollständige Konfiguration übernommen und danach als `loxone.yaml.legacy` gesichert. Eine fehlgeschlagene Migration beendet den Start, statt alte Mappings stillschweigend zu verwerfen; Regressionstests prüfen Übernahme, spätere Änderungen und fehlgeschlagenes Speichern.
+
+Validierung des neuen Stands:
+
+- Go 1.26.10, Linux, UID 1000: `go test -race -coverprofile=... -coverpkg=./... ./...` bestanden; Gesamt-Coverage 85,9 %. `go vet ./...` ohne Befund.
+- 34 Frontend-Tests in sechs Dateien bestanden; Produktionsbuild und zusätzlicher Coverage-Lauf erfolgreich.
+- Vite 8.3.5, Vitest/Coverage 5.0.5, React-Plugin 6.1.2 und Tailwind 3.4.19; aktualisierter Lockfile. `npm audit` meldet 0 bekannte Schwachstellen.
+- Gepatchtes Go-Build-Image 1.26.10; `govulncheck@v1.9.0` ohne bekannte Schwachstellen. Der vorherige Go-1.26-Build wurde wegen [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809) aktualisiert.
+- Docker-Image lokal gebaut; Persistenztest nach Container-Neuerstellung erfolgreich. Shell-Syntax, Compose-Konfiguration und Modul-Konsistenz ebenfalls ohne Befund.
+- Frontend-Build läuft auf der nativen Builder-Architektur, damit ARMv7-Add-ons keine nicht verfügbare Rolldown-musl-Bindung benötigen.
+- Kein Test gegen reale KLF-200-Geräte oder einen laufenden HA-Supervisor. Stop priorisiert wartende Exchanges; ein bereits laufender Exchange wird nicht mitten im Protokoll unterbrochen. Das Add-on muss mit einer neuen Veröffentlichung gebaut werden, damit sein Source-Tag diese Änderungen enthält.
+
+## Ursprünglicher Umfang und damalige Validierung
 
 Geprüft wurden Go-Backend, React-Frontend, vorhandene Tests, Docker-Konfiguration, Home-Assistant-Add-on und Dokumentation. Die Befunde stammen aus einer statischen Codeprüfung; die beschriebenen Fehlerszenarien wurden nicht jeweils durch zusätzliche Reproduktionstests nachgewiesen.
 
@@ -23,7 +55,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-01 – Speicherfehler werden als Erfolg gemeldet
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstelle: `internal/configmgr/manager.go:86` und Sidecar-Speicherung ab Zeile 96.
 - Befund: `UpdateConfig` protokolliert Fehler beim Speichern der Hauptdatei oder der Loxone-Sidecar-Datei, übernimmt die Konfiguration trotzdem im Speicher und gibt `nil` zurück. API-Aufrufer erhalten dadurch eine Erfolgsmeldung für nicht dauerhaft gespeicherte Änderungen.
 - Auswirkung: Einstellungen und Mappings können nach einem Neustart verschwinden. Auch Tokenänderungen können sich im laufenden Betrieb und nach Neustart unterschiedlich auswirken.
@@ -33,7 +65,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-02 – Docker-Konfiguration verhindert persistente API-Änderungen
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstellen: `docker-compose.yml:11`, `Dockerfile:36` und `Dockerfile:53`.
 - Befund: Compose bindet `/app/config.yaml` schreibgeschützt ein. Das Verzeichnis `/app` erhält keine Schreibrechte für den später verwendeten Benutzer `appuser`. Die daneben abgelegte `loxone.yaml` kann daher im vorgesehenen Standardbetrieb ebenfalls nicht angelegt werden.
 - Auswirkung: Über die API vorgenommene Konfigurations- und Mappingänderungen können nicht dauerhaft gespeichert werden. Q-01 verdeckt dies zusätzlich.
@@ -42,7 +74,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-03 – Gleichzeitige Änderungen können sich überschreiben
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstellen: `internal/api/handlers.go:445`, `:589`, `:613`, `:645`, `:689`; `internal/configmgr/manager.go:57` und `:76`.
 - Befund: Handler lesen eine vollständige Konfigurationskopie, verändern diese und speichern sie später zurück. Lesen und Schreiben sind jeweils geschützt, der gesamte Lese-Ändere-Schreib-Ablauf jedoch nicht.
 - Auswirkung: Zwei gleichzeitige Mapping-Anlagen können erfolgreich antworten, obwohl die zuletzt gespeicherte Kopie die andere Änderung wieder entfernt. Auch Änderungen an unterschiedlichen Konfigurationsfeldern können verloren gehen.
@@ -51,7 +83,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-04 – Abgelaufene Requests können noch Gerätebefehle senden
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstellen: `internal/klf200/client.go:415` und `:643`; weitere Exchanges verwenden ebenfalls `exchangeMu`.
 - Befund: Das Warten auf `exchangeMu` berücksichtigt den Request-Kontext nicht. Nach Erwerb des Locks wird der Befehl gesendet, bevor beim Warten auf die Antwort die Kontextüberschreitung ausgewertet wird. `sendRaw` verwendet einen eigenen Schreibtimeout statt des Request-Kontexts.
 - Auswirkung: Ein bereits abgebrochener oder abgelaufener HTTP-Request kann später noch eine Gerätebewegung auslösen. Stop-Befehle warten zudem hinter anderen Exchanges.
@@ -62,7 +94,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-05 – Unbekannte Messwerte erscheinen als eindeutige Zustände
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstellen: `internal/klf200/types.go:330`, `web/src/components/SensorCard.tsx:42` und `:54`.
 - Befund: `PositionToPercent` wandelt auch `PositionUnknown` in 100 Prozent um. Die Sensoranzeige verwendet bei fehlenden Sensordaten dieselbe Darstellung wie bei ausdrücklich negativen Regen-/Windwerten.
 - Auswirkung: Eine unbekannte Position kann als „geschlossen“ erscheinen; noch nicht abgefragte Sensoren werden als „Kein Regen“ beziehungsweise „Kein Wind“ dargestellt.
@@ -72,7 +104,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-06 – Unvollständige Sensorantworten können als Erfolg gelten
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstelle: `internal/klf200/client.go:553` und Aktualisierung des Zeitstempels in `RefreshSensorStatus`.
 - Befund: Nach mindestens einer empfangenen Limitation-Meldung wird ein späterer Timeout als Erfolg behandelt. Beim Zählen werden weder die Session-ID noch eindeutige angefragte Node-IDs geprüft. Danach kann der Gesamtstatus einen neuen Aktualisierungszeitpunkt erhalten.
 - Auswirkung: Teilweise alte Sensorwerte können als frisch abgefragt erscheinen; doppelte oder fremde Meldungen können die erwartete Anzahl vorzeitig erfüllen.
@@ -81,7 +113,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-07 – Konfigurationsdateien werden nicht atomar geschrieben
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstelle: `internal/config/config.go:226`.
 - Befund: `os.WriteFile` überschreibt die Zieldatei direkt. Hauptkonfiguration und Sidecar werden unabhängig voneinander geschrieben.
 - Auswirkung: Ein Prozessabbruch oder Schreibfehler kann eine leere beziehungsweise unvollständige Datei hinterlassen; beide Dateien können unterschiedliche Konfigurationsstände enthalten.
@@ -90,7 +122,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-08 – Dashboard vermischt Ziel- und Istposition
 
-- [ ] Beheben und prüfen
+- [x] Implementiert und durch Regressionstests geprüft (siehe Umsetzungsstand)
 - Fundstelle: `web/src/components/Dashboard.tsx:119`.
 - Befund: Nach Annahme eines Befehls setzt `applyPosition` die angezeigte Istposition sofort auf den Zielwert. Bei fehlgeschlagenem Polling bleibt ausserdem der letzte erfolgreiche Verbindungsstatus erhalten.
 - Auswirkung: Noch fahrende oder blockierte Geräte können bereits als vollständig offen/geschlossen erscheinen. Ein alter Status kann weiterhin „Verbunden“ anzeigen.
@@ -101,7 +133,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-09 – Zuständigkeit für Home-Assistant-Einstellungen klären
 
-- [ ] Bearbeiten
+- [x] Implementiert (siehe Umsetzungsstand)
 - Fundstelle: `loxone2velux/run.sh:55`.
 - Befund: Die Hauptkonfiguration wird bei jedem Add-on-Start aus den HA-Optionen neu erzeugt. Änderungen an KLF-200-Zugangsdaten, API-Token oder Log-Level über die REST-API werden dadurch beim Neustart ersetzt. Nur die Loxone-Einstellungen besitzen eine separate Sidecar-Persistenz.
 - Umsetzung: Eine eindeutige Quelle für diese Einstellungen festlegen. Falls HA-Optionen massgeblich bleiben, dies in API-Verhalten und Dokumentation kenntlich machen.
@@ -109,7 +141,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-10 – UDP-Zustandsabgleich ergänzen
 
-- [ ] Bearbeiten
+- [x] Implementiert (siehe Umsetzungsstand)
 - Fundstellen: `internal/gateway/service.go:189`, `:306` und `:327`.
 - Befund: Vollständige Node-Refreshes ersetzen den Cache, senden aber keinen Positionsabgleich an Loxone. Sensorfeedback wird bei Änderungen gesendet.
 - Auswirkung: Nach einem Miniserver-Neustart oder verlorenen UDP-Paketen können unveränderte Zustände auf Empfängerseite fehlen, bis neue Ereignisse auftreten.
@@ -118,7 +150,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-11 – Positionsregler per Tastatur vollständig bedienbar machen
 
-- [ ] Bearbeiten
+- [x] Implementiert (siehe Umsetzungsstand)
 - Fundstelle: `web/src/components/NodeCard.tsx:119`.
 - Befund: Ein Positionsbefehl wird über `onMouseUp` beziehungsweise `onTouchEnd` ausgelöst. Tastaturänderungen des Range-Inputs besitzen keinen entsprechenden Commit-Pfad.
 - Umsetzung: Einheitliches, tastaturfähiges Commit-Verhalten mit sinnvoller Begrenzung der Befehlsrate implementieren; zugängliche Beschriftung des Reglers ergänzen.
@@ -126,7 +158,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-12 – Loxone-Anleitung an tatsächliche Verbindung anpassen
 
-- [ ] Bearbeiten
+- [x] Implementiert (siehe Umsetzungsstand)
 - Fundstellen: `web/src/components/LoxoneGuide.tsx:74` und `:80`.
 - Befund: Die Anleitung verwendet fest Port 8099, während der standalone Docker-Betrieb standardmässig Port 8080 nutzt. Tokens werden ohne URL-Encoding in Query-Beispiele eingesetzt. Der Browser-Hostname muss bei Proxy-Zugriff zudem nicht der direkt erreichbaren Gateway-Adresse entsprechen.
 - Umsetzung: Direkte Gateway-Adresse konfigurierbar machen oder passend vorbelegen. Query-Tokens mit `encodeURIComponent` kodieren.
@@ -134,7 +166,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-13 – SLIP-Empfangspuffer begrenzen
 
-- [ ] Bearbeiten
+- [x] Implementiert (siehe Umsetzungsstand)
 - Fundstelle: `internal/klf200/client.go:846`.
 - Befund: Zwischen SLIP-Endmarkierungen wächst `frameBuf` ohne Obergrenze.
 - Auswirkung: Ein fehlerhafter oder manipulierter Datenstrom kann den Speicherverbrauch unbegrenzt erhöhen.
@@ -143,7 +175,7 @@ Bestehende Tests sichern wesentliche Standardabläufe ab, decken die folgenden R
 
 ### Q-14 – Tests und CI um relevante Fehlerpfade erweitern
 
-- [ ] Bearbeiten
+- [x] Implementiert (siehe Umsetzungsstand)
 - Bestehende Tests zu Persistenzfehlern und unbekannten Positionen bei geänderter Semantik aktualisieren.
 - Reproduktionstests für Q-03, Q-04 und Q-06 ergänzen.
 - Fehlende beziehungsweise veraltete Sensorwerte und Ziel-/Istposition im Frontend testen.

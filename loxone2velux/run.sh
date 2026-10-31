@@ -5,6 +5,8 @@
 # Config at /config/loxone2velux/config.yaml
 # ==============================================================================
 
+set -eu
+
 echo "=== Loxone2Velux Gateway starting ==="
 
 # Read add-on options from Home Assistant
@@ -56,7 +58,9 @@ fi
 # Mappings and UDP feedback live in loxone.yaml next to it and are not touched.
 mkdir -p "${CONFIG_DIR}"
 umask 077
-cat > "${CONFIG_FILE}" << EOF
+CONFIG_TEMP=$(mktemp "${CONFIG_DIR}/.config-XXXXXX")
+trap 'rm -f "$CONFIG_TEMP"' EXIT
+cat > "${CONFIG_TEMP}" << EOF
 klf200:
   host: ${KLF200_HOST}
   port: ${KLF200_PORT}
@@ -75,6 +79,8 @@ logging:
   level: ${LOG_LEVEL}
   format: "console"
 EOF
+mv "${CONFIG_TEMP}" "${CONFIG_FILE}"
+trap - EXIT
 
 echo "Configuration written to ${CONFIG_FILE}"
 
@@ -84,4 +90,4 @@ cd /app || true
 echo "Starting binary..."
 
 # Start the gateway (exec replaces shell with Go binary)
-exec /usr/bin/loxone2velux -config "${CONFIG_FILE}"
+exec /usr/bin/loxone2velux -config "${CONFIG_FILE}" -managed-config

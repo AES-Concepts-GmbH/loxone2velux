@@ -1,13 +1,14 @@
 /// <reference types="vitest" />
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
+import { fileURLToPath } from 'url'
 import react from '@vitejs/plugin-react'
 
 function getVersion(): string {
   if (process.env.VITE_APP_VERSION) return process.env.VITE_APP_VERSION
   try {
-    return readFileSync(resolve(__dirname, '../VERSION'), 'utf-8').trim()
+    return readFileSync(resolve(fileURLToPath(new URL('.', import.meta.url)), '../VERSION'), 'utf-8').trim()
   } catch {
     return 'dev'
   }
@@ -33,6 +34,7 @@ export default defineConfig({
     },
   },
   build: {
+    target: 'es2020',
     outDir: 'dist',
     sourcemap: false,
   },

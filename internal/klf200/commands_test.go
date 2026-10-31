@@ -236,8 +236,8 @@ func TestPercentConversion(t *testing.T) {
 	if PositionToPercent(0xC800) != 100 || PositionToPercent(0) != 0 {
 		t.Error("raw endpoints")
 	}
-	if PositionToPercent(PositionUnknown) != 100 {
-		t.Error("out-of-range raw values clamp to 100")
+	if PositionToPercent(PositionUnknown) != -1 {
+		t.Error("out-of-range raw values must be explicitly unknown")
 	}
 	for _, p := range []float64{0, 1, 25, 50, 99, 100} {
 		if got := PositionToPercent(PercentToPosition(p)); got < p-0.01 || got > p+0.01 {

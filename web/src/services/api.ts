@@ -10,6 +10,7 @@ import {
 } from '../types';
 
 const TOKEN_STORAGE_KEY = 'api_token';
+const REQUEST_TIMEOUT_MS = 15000;
 
 // Build the base path for API requests from the current page URL.
 // HA Ingress can produce double slashes (ingress_entry: / appended to
@@ -61,6 +62,7 @@ function authHeaders(): Record<string, string> {
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(getBasePath() + url, {
     ...options,
+    signal: options?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       ...authHeaders(),
@@ -88,7 +90,7 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
 
 // Health check (no auth required)
 export async function getHealth(): Promise<HealthResponse> {
-  const response = await fetch(getBasePath() + 'health');
+  const response = await fetch(getBasePath() + 'health', { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(`Health ${response.status} from ${response.url}`);
   }
@@ -101,7 +103,7 @@ export async function getHealth(): Promise<HealthResponse> {
 
 // Whether the gateway requires an API token (no auth required for this call)
 export async function isAuthRequired(): Promise<boolean> {
-  const response = await fetch(getBasePath() + 'api/auth/status');
+  const response = await fetch(getBasePath() + 'api/auth/status', { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!response.ok) return false;
   const data = (await response.json()) as { required: boolean };
   return data.required;

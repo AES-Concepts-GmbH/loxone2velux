@@ -4,6 +4,8 @@ package configmgr
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -26,13 +28,19 @@ type Manager struct {
 	setLogLevel func(level string)
 	// reconnectTimeout bounds the background reconnect after a KLF-200 change.
 	reconnectTimeout time.Duration
+	managed          bool
 }
+
+// SetManagedConfig makes HA options authoritative for all non-Loxone settings.
+// Call before exposing the manager to requests.
+func (m *Manager) SetManagedConfig()   { m.managed = true }
+func (m *Manager) ManagedConfig() bool { return m.managed }
 
 // New creates a Manager. configPath is where the full configuration is saved,
 // loxonePath (optional) is the sidecar file for the UI-managed Loxone settings.
 func New(cfg *config.Config, configPath, loxonePath string, gw *gateway.Service, logger zerolog.Logger) *Manager {
 	return &Manager{
-		cfg:              cfg,
+		cfg:              cfg.Clone(),
 		configPath:       configPath,
 		loxonePath:       loxonePath,
 		gateway:          gw,
@@ -76,29 +84,54 @@ func (m *Manager) GetConfigPath() string {
 func (m *Manager) UpdateConfig(cfg *config.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.updateConfig(cfg.Clone())
+}
+
+// ModifyConfig serializes the entire read/modify/validate/persist/apply operation.
+func (m *Manager) ModifyConfig(change func(*config.Config) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg := m.cfg.Clone()
+	if err := change(cfg); err != nil {
+		return err
+	}
+	return m.updateConfig(cfg)
+}
+
+func (m *Manager) updateConfig(cfg *config.Config) error {
+	if m.managed {
+		before, after := m.cfg.Clone(), cfg.Clone()
+		before.Loxone, after.Loxone = config.LoxoneConfig{}, config.LoxoneConfig{}
+		if !reflect.DeepEqual(before, after) {
+			return fmt.Errorf("%w: change connection, token and logging in Home Assistant add-on options", config.ErrValidation)
+		}
+	}
 
 	// Validate
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-
-	// Save to file
-	if err := cfg.Save(m.configPath); err != nil {
-		m.logger.Error().Err(err).Msg("Failed to save config file")
-		// Continue anyway - config is updated in memory
-	} else {
-		m.logger.Info().Str("path", m.configPath).Msg("Configuration saved")
-	}
-
-	// Persist the UI-managed Loxone settings to the sidecar file so they
-	// survive add-on restarts (which regenerate config.yaml from add-on options).
-	if m.loxonePath != "" {
-		if err := config.SaveLoxoneConfig(m.loxonePath, &cfg.Loxone); err != nil {
-			m.logger.Error().Err(err).Msg("Failed to save Loxone sidecar config")
-		} else {
-			m.logger.Info().Str("path", m.loxonePath).Msg("Loxone configuration saved")
+	commitUDP := func() {}
+	if m.gateway != nil && m.cfg.Loxone.UDPFeedback != cfg.Loxone.UDPFeedback {
+		commit, abort, err := m.gateway.GetUDPSender().Prepare(cfg.Loxone.UDPFeedback)
+		if err != nil {
+			return fmt.Errorf("prepare UDP feedback: %w", err)
 		}
+		defer abort()
+		commitUDP = commit
 	}
+
+	// Exactly one authoritative file per mode avoids partially committed pairs.
+	var err error
+	if m.managed {
+		err = config.SaveLoxoneConfig(m.loxonePath, &cfg.Loxone)
+	} else {
+		err = cfg.Save(m.configPath)
+	}
+	if err != nil {
+		return fmt.Errorf("persist configuration: %w", err)
+	}
+	commitUDP()
 
 	// Apply log level immediately
 	if cfg.Logging.Level != m.cfg.Logging.Level {
@@ -136,11 +169,6 @@ func (m *Manager) UpdateConfig(cfg *config.Config) error {
 
 	// Reconfigure UDP sender and mappings
 	if m.gateway != nil {
-		if udpSender := m.gateway.GetUDPSender(); udpSender != nil {
-			if err := udpSender.Configure(cfg.Loxone.UDPFeedback); err != nil {
-				m.logger.Error().Err(err).Msg("Failed to reconfigure UDP sender")
-			}
-		}
 		if mappingMgr := m.gateway.GetMappingManager(); mappingMgr != nil {
 			mappingMgr.Load(cfg.Loxone.Mappings)
 		}

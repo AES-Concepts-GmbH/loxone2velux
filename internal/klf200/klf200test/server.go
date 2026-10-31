@@ -50,15 +50,40 @@ type Server struct {
 	listener net.Listener
 	t        testing.TB
 
-	mu          sync.Mutex
-	nodes       []Node
-	commands    []Command
-	conns       []net.Conn
-	rejectCmds  bool
-	silent      bool // do not answer GW_GET_STATE_REQ
-	noFinished  bool // omit GW_SESSION_FINISHED_NTF
-	acceptCount int
-	closed      bool
+	mu              sync.Mutex
+	nodes           []Node
+	commands        []Command
+	conns           []net.Conn
+	rejectCmds      bool
+	silent          bool // do not answer GW_GET_STATE_REQ
+	noFinished      bool // omit GW_SESSION_FINISHED_NTF
+	acceptCount     int
+	closed          bool
+	limitationFault string
+	stateRequests   int
+}
+
+func (s *Server) StateRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stateRequests
+}
+
+// SetLimitationFault injects missing, duplicate or wrong-session replies.
+func (s *Server) SetLimitationFault(fault string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.limitationFault = fault
+}
+
+// PushRaw injects a malformed wire stream for framing recovery tests.
+func (s *Server) PushRaw(data []byte) {
+	s.mu.Lock()
+	conns := append([]net.Conn(nil), s.conns...)
+	s.mu.Unlock()
+	for _, c := range conns {
+		c.Write(data)
+	}
 }
 
 // NewServer starts a simulated KLF-200 on 127.0.0.1 with the given password
@@ -281,6 +306,7 @@ func (s *Server) handle(conn net.Conn, f *klf200.Frame, authenticated *bool) boo
 
 	case klf200.GW_GET_STATE_REQ:
 		s.mu.Lock()
+		s.stateRequests++
 		silent := s.silent
 		s.mu.Unlock()
 		if !silent {
@@ -362,8 +388,21 @@ func (s *Server) handle(conn net.Conn, f *klf200.Frame, authenticated *bool) boo
 		sessionID := binary.BigEndian.Uint16(f.Data[0:2])
 		count := int(f.Data[2])
 		nodeIDs := f.Data[3 : 3+count]
+		s.mu.Lock()
+		fault := s.limitationFault
+		s.mu.Unlock()
 		send(conn, klf200.GW_GET_LIMITATION_STATUS_CFM, append(sessionBytes(sessionID), 1))
-		for _, id := range nodeIDs {
+		for i, id := range nodeIDs {
+			if fault == "missing" && i > 0 {
+				continue
+			}
+			if fault == "duplicate" {
+				id = nodeIDs[0]
+			}
+			replySession := sessionID
+			if fault == "session" {
+				replySession++
+			}
 			s.mu.Lock()
 			var origin klf200.LimitationOriginator
 			for _, n := range s.nodes {
@@ -372,7 +411,7 @@ func (s *Server) handle(conn net.Conn, f *klf200.Frame, authenticated *bool) boo
 				}
 			}
 			s.mu.Unlock()
-			send(conn, klf200.GW_LIMITATION_STATUS_NTF, limitationPayload(sessionID, id, origin))
+			send(conn, klf200.GW_LIMITATION_STATUS_NTF, limitationPayload(replySession, id, origin))
 		}
 		send(conn, klf200.GW_SESSION_FINISHED_NTF, sessionBytes(sessionID))
 

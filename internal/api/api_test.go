@@ -35,11 +35,19 @@ func (m *memConfigManager) GetAPIToken() string {
 }
 
 func (m *memConfigManager) UpdateConfig(cfg *config.Config) error {
+	return m.ModifyConfig(func(current *config.Config) error { *current = *cfg.Clone(); return nil })
+}
+
+func (m *memConfigManager) ModifyConfig(change func(*config.Config) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg := m.cfg.Clone()
+	if err := change(cfg); err != nil {
+		return err
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.cfg = cfg
 	if m.gateway != nil {
 		if err := m.gateway.GetUDPSender().Configure(cfg.Loxone.UDPFeedback); err != nil {
@@ -128,7 +136,7 @@ func TestTokenAuth(t *testing.T) {
 	if resp, _ := do(t, "GET", ts.URL+"/api/nodes", "", map[string]string{"Authorization": "Bearer " + token}); resp.StatusCode != 200 {
 		t.Errorf("bearer status = %d", resp.StatusCode)
 	}
-	if resp, body := do(t, "GET", ts.URL+"/loxone/sensors?token="+token, "", nil); resp.StatusCode != 200 || body != "0;0" {
+	if resp, body := do(t, "GET", ts.URL+"/loxone/sensors?token="+token, "", nil); resp.StatusCode != 503 || body != "ERROR" {
 		t.Errorf("query token status = %d body = %q", resp.StatusCode, body)
 	}
 

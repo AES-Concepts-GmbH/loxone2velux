@@ -71,12 +71,12 @@ func (m *NodeManager) UpdateNode(update *Node) {
 			node.PositionPercent = update.PositionPercent
 			node.TargetPosition = update.TargetPosition
 			node.TargetPercent = update.TargetPercent
+			node.LastUpdate = time.Now()
 		}
 		node.State = update.State
 		if update.StateStr != "" {
 			node.StateStr = update.StateStr
 		}
-		node.LastUpdate = time.Now()
 	}
 }
 
