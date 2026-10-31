@@ -60,6 +60,32 @@ func TestIncompleteSensorRefreshNeverPublishesFreshState(t *testing.T) {
 	}
 }
 
+func TestSlowPerNodeRepliesCompleteWithinPerFrameBudget(t *testing.T) {
+	frameTimeout := 150 * time.Millisecond
+	defer klf200.SetLimitationFrameTimeout(frameTimeout)()
+	srv := klf200test.NewServer(t, testPassword, testNodes()...)
+	c := connect(t, srv)
+	// A full chunk answered one node at a time takes far longer than a single
+	// frame budget; every individual frame still arrives well within it.
+	srv.SetLimitationFault("slow")
+	nodeIDs := make([]uint8, klf200.MaxNodesPerRequest)
+	for i := range nodeIDs {
+		nodeIDs[i] = uint8(i)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := c.RefreshSensorStatus(ctx, nodeIDs); err != nil {
+		t.Fatalf("slow but complete refresh failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed <= frameTimeout {
+		t.Fatalf("simulator did not exceed one frame budget (%v)", elapsed)
+	}
+	if !c.GetSensorStatus().Valid {
+		t.Fatal("complete refresh not published")
+	}
+}
+
 func TestOversizedSLIPStreamRecoversAtNextFrame(t *testing.T) {
 	srv := klf200test.NewServer(t, testPassword, testNodes()...)
 	c := connect(t, srv)

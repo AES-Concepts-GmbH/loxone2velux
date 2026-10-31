@@ -69,7 +69,10 @@ func (s *Server) StateRequests() int {
 	return s.stateRequests
 }
 
-// SetLimitationFault injects missing, duplicate or wrong-session replies.
+// SlowLimitationDelay is the per-node delay used by the "slow" limitation fault.
+const SlowLimitationDelay = 40 * time.Millisecond
+
+// SetLimitationFault injects missing, duplicate, wrong-session or slow replies.
 func (s *Server) SetLimitationFault(fault string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -402,6 +405,10 @@ func (s *Server) handle(conn net.Conn, f *klf200.Frame, authenticated *bool) boo
 			replySession := sessionID
 			if fault == "session" {
 				replySession++
+			}
+			if fault == "slow" {
+				// Real gateways query each actuator over the radio first.
+				time.Sleep(SlowLimitationDelay)
 			}
 			s.mu.Lock()
 			var origin klf200.LimitationOriginator
